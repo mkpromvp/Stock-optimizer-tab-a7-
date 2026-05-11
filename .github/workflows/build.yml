@@ -81,7 +81,6 @@ jobs:
             echo "❌ super.img not found!" && exit 1
           fi
 
-          echo "Converting super to raw..."
           simg2img work/super_sparse.img work/super.img
           echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
 
@@ -114,13 +113,14 @@ jobs:
         run: |
           mkdir -p newimg temp_mount
 
-          # حساب الحجم بشكل أفضل + مساحة إضافية أكبر
+          # حل المشكلة: حجم أكبر + alignment
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 3221225472))  # +3GB لتجنب مشكلة img2simg
+          SIZE=$((SIZE + 4294967296))  # +4GB
+          SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))  # Align to 4KB
 
           echo "Final System Size = $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
-          mkfs.ext4 -F newimg/system_new.img
+          mkfs.ext4 -F -b 4096 newimg/system_new.img
 
           sudo mount -o loop newimg/system_new.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
@@ -130,6 +130,7 @@ jobs:
 
       - name: Convert to Sparse & Rebuild Super
         run: |
+          echo "Converting to sparse image..."
           img2simg newimg/system_new.img newimg/system.img
 
           cp newimg/system.img partitions/system.img
