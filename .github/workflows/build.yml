@@ -22,11 +22,9 @@ jobs:
             lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
             build-essential git zlib1g-dev liblz4-tool jq curl
 
-          # Compile simg2img
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-          # Download lpunpack & lpmake
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
@@ -54,17 +52,13 @@ jobs:
       - name: Prepare Super Image
         run: |
           simg2img work/super_sparse.img work/super.img || cp work/super_sparse.img work/super.img
-          
           ORIGINAL_SUPER=$(stat -c%s work/super.img)
           echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER" >> $GITHUB_ENV
-          echo "Original Super Size: $ORIGINAL_SUPER bytes"
-
-          cd partitions && lpunpack ../work/super.img . && ls -lh
+          cd partitions && lpunpack ../work/super.img .
 
       - name: Convert System & Mount
         run: |
           mkdir -p mnt extracted_system
-          # Directly mount, lpunpack already outputs raw!
           sudo mount -o loop partitions/system.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
@@ -75,24 +69,26 @@ jobs:
           chmod +x debloat.sh
           echo "APKs before: $(find extracted_system -name "*.apk" | wc -l)"
           
+          # Run with sudo to ensure deletion works
           sudo ./debloat.sh "$(pwd)/extracted_system"
           
           echo "=== Removing OneUI Blur ==="
-          sudo rm -rf extracted_system/system/system/lib64/*blur* 2>/dev/null || true
-          sudo rm -rf extracted_system/system/system/lib64/*gaussian* 2>/dev/null || true
-          sudo find extracted_system -name "*blur*" -type f -exec rm -rf {} + 2>/dev/null || true
+          sudo find extracted_system -name "*blur*" -exec rm -rf {} + 2>/dev/null || true
+          sudo find extracted_system -name "*gaussian*" -exec rm -rf {} + 2>/dev/null || true
 
           echo "APKs after: $(find extracted_system -name "*.apk" | wc -l)"
 
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
+          # Calculate size with 300MB extra buffer to avoid "No space left on device"
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          BUFFER=$((150 * 1024 * 1024))
-          SIZE=$((SIZE + BUFFER))
-          SIZE=$(( (SIZE / 4096 + 1) * 4096 ))
+          BUFFER=$((300 * 1024 * 1024))
+          TOTAL_SIZE=$((SIZE + BUFFER))
+          # Round to 4096 blocks
+          TOTAL_SIZE=$(( (TOTAL_SIZE / 4096 + 1) * 4096 ))
 
-          truncate -s $SIZE newimg/system_new.img
+          truncate -s $TOTAL_SIZE newimg/system_new.img
           mkfs.ext4 -F -b 4096 newimg/system_new.img
 
           sudo mount -o loop newimg/system_new.img temp_mount
@@ -120,18 +116,16 @@ jobs:
         run: |
           lz4 -B6 --content-size super_new.img super.img.lz4
           mkdir -p final_ap
-          
-          find firmware -maxdepth 1 -type f ! -name "*.zip" ! -name "*.tar" ! -name "super*" -exec cp {} final_ap/ \; 2>/dev/null || true
-          
+          cp firmware/* final_ap/ 2>/dev/null || true
           mv super.img.lz4 final_ap/
           cd final_ap
           tar -cf AP_MODDED.tar *
           md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
 
-      - name: Upload to GoFile.io
+      - name: Upload Result
         run: |
           FILE="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
           LINK=$(curl -# -F "file=@$FILE" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "🔗 $LINK"
+          echo "🔗 Download Link: $LINK"
