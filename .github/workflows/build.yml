@@ -23,11 +23,11 @@ jobs:
             android-sdk-libsparse-utils build-essential git \
             zlib1g-dev liblz4-tool
 
-          # Compile simg2img & img2simg
+          # simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-          # lpunpack & lpmake من ريبو SReStocker
+          # lpunpack & lpmake
           mkdir -p bin
           cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
@@ -42,46 +42,58 @@ jobs:
           echo "Downloading: ${{ github.event.inputs.firmware_url }}"
           aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
 
-      - name: Extract Firmware (ZIP + tar.md5)
+      - name: Full Firmware Extraction (ZIP + tar.md5 + lz4)
         run: |
           cd firmware
 
-          # استخراج الـ ZIP إذا وجد
+          echo "=== Extracting ZIP files ==="
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
-              echo "Extracting ZIP: $zipfile"
-              7z x -y "$zipfile" >/dev/null
+              echo "Extracting $zipfile"
+              7z x -y "$zipfile" >/dev/null 2>&1
               rm -f "$zipfile"
             fi
           done
 
-          # البحث عن ملف tar.md5
-          APFILE=$(find . -name "*.tar.md5" -o -name "*.tar" | head -n 1)
-          if [ -n "$APFILE" ]; then
-            echo "Found AP File: $APFILE"
-            cp "$APFILE" ap.tar.md5
-            echo "Extracting AP.tar.md5 ..."
-            tar -xf ap.tar.md5
-            rm -f ap.tar.md5 "$APFILE"
-          else
-            echo "❌ No .tar.md5 file found!"
-            ls -lh
-            exit 1
-          fi
+          echo "=== Extracting tar.md5 files ==="
+          for tarfile in *.tar.md5 *.tar; do
+            if [ -f "$tarfile" ]; then
+              echo "Extracting $tarfile"
+              tar -xf "$tarfile" >/dev/null 2>&1
+              rm -f "$tarfile"
+            fi
+          done
 
-          echo "Extracted files:"
+          echo "=== Decompressing all .lz4 files ==="
+          for lz4file in *.lz4; do
+            if [ -f "$lz4file" ]; then
+              echo "Decompressing $lz4file"
+              lz4 -d "\( lz4file" " \){lz4file%.lz4}" >/dev/null 2>&1
+              rm -f "$lz4file"
+            fi
+          done
+
+          echo "=== Extracted files ==="
           ls -lh
+          echo "Looking for super.img..."
+          find . -name "*super*" -ls
 
-      - name: Decompress SUPER
+      - name: Locate and Decompress SUPER
         run: |
           mkdir -p work
-          if [ -f firmware/super.img.lz4 ]; then
-            lz4 -d firmware/super.img.lz4 work/super.img
-          elif [ -f firmware/super.img ]; then
-            cp firmware/super.img work/super.img
+
+          SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
+          SUPER_RAW=$(find firmware -name "super.img" | head -n 1)
+
+          if [ -n "$SUPER_LZ4" ]; then
+            echo "Found: $SUPER_LZ4"
+            lz4 -d "$SUPER_LZ4" work/super.img
+          elif [ -n "$SUPER_RAW" ]; then
+            echo "Found: $SUPER_RAW"
+            cp "$SUPER_RAW" work/super.img
           else
-            echo "❌ super.img or super.img.lz4 not found!"
-            ls -lh firmware
+            echo "❌ super.img.lz4 or super.img not found!"
+            find firmware -name "*.img*" | head -10
             exit 1
           fi
 
@@ -122,13 +134,11 @@ jobs:
           sync
           sudo umount temp_mount
 
-      - name: Convert to Sparse Image
+      - name: Convert to Sparse & Rebuild
         run: |
           img2simg newimg/system_new.img newimg/system.img
-
-      - name: Replace System & Rebuild Super
-        run: |
           cp newimg/system.img partitions/system.img
+
           cd partitions
           SYSTEM_SIZE=$(stat -c%s system.img)
 
