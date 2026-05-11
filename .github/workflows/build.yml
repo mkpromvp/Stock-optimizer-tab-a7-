@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       firmware_url:
-        description: "Direct firmware/AP file link"
+        description: "Direct AP.tar.md5 link"
         required: true
 
 jobs:
@@ -18,85 +18,146 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
+
           sudo apt install -y \
-            lz4 p7zip-full android-sdk-libsparse-utils \
-            simg2img img2simg zip unzip aria2
+            lz4 \
+            p7zip-full \
+            zip \
+            unzip \
+            aria2 \
+            e2fsprogs \
+            ext4magic \
+            android-sdk-libsparse-utils
+
+          # تنزيل أدوات Android يدوياً
+          mkdir tools
+          cd tools
+
+          wget https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          unzip platform-tools-latest-linux.zip
+
+          wget https://dl.google.com/android/repository/otatools.zip
+          unzip otatools.zip || true
+
+          sudo cp -r platform-tools/* /usr/local/bin/ || true
 
       - name: Download Firmware
         run: |
           mkdir firmware
           cd firmware
+
           aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}"
 
-      - name: Extract AP TAR
+      - name: Extract AP
         run: |
           mkdir extracted
-          APFILE=$(find firmware -name "AP*.tar.md5" -o -name "AP*.tar")
-          
+
+          APFILE=$(find firmware -name "*.tar.md5" -o -name "*.tar" | head -n 1)
+
+          echo "Using AP File: $APFILE"
+
           cp "$APFILE" ap.tar
+
           tar -xf ap.tar -C extracted
 
-      - name: Extract SUPER IMG
+      - name: Decompress SUPER
         run: |
           mkdir work
-          cd extracted
 
-          if [ -f super.img.lz4 ]; then
-            lz4 -d super.img.lz4 super.img
+          if [ -f extracted/super.img.lz4 ]; then
+            lz4 -d extracted/super.img.lz4 work/super.img
+          elif [ -f extracted/super.img ]; then
+            cp extracted/super.img work/
+          else
+            echo "super.img not found!"
+            exit 1
           fi
 
-          mv super.img ../work/
-
-      - name: Unpack Super
+      - name: Download lpunpack Tools
         run: |
-          cd work
+          mkdir bin
+          cd bin
 
-          lpunpack super.img .
+          wget https://github.com/LineageOS/android_tools_extract-utils/releases/download/latest/lpunpack
+          wget https://github.com/LineageOS/android_tools_extract-utils/releases/download/latest/lpmake
 
-          mkdir system_raw
+          chmod +x lpunpack
+          chmod +x lpmake
 
-          simg2img system.img system_raw/system_raw.img
+          sudo mv lpunpack /usr/local/bin/
+          sudo mv lpmake /usr/local/bin/
+
+      - name: Extract Dynamic Partitions
+        run: |
+          mkdir partitions
+          cd partitions
+
+          lpunpack ../work/super.img .
+
+          ls
+
+      - name: Convert System IMG
+        run: |
+          mkdir raw
+
+          simg2img partitions/system.img raw/system_raw.img
 
       - name: Mount System
         run: |
           mkdir mnt
-          sudo mount -o loop work/system_raw/system_raw.img mnt
+          sudo mount -o loop raw/system_raw.img mnt
 
-      - name: Copy System RW
+      - name: Copy Mounted System
         run: |
           mkdir extracted_system
+
           sudo cp -a mnt/. extracted_system/
+
           sudo umount mnt
 
       - name: Run Debloat Script
         run: |
           chmod +x debloat.sh
+
           ./debloat.sh extracted_system
 
-      - name: Repack System IMG
+      - name: Create New System IMG
         run: |
           mkdir newimg
 
-          dd if=/dev/zero of=newimg/system_new.img bs=1M count=8192
+          SIZE=$(du -sb extracted_system | cut -f1)
+
+          SIZE=$((SIZE + 2147483648))
+
+          echo "Final Size = $SIZE"
+
+          truncate -s $SIZE newimg/system_new.img
 
           mkfs.ext4 -F newimg/system_new.img
 
           mkdir temp_mount
+
           sudo mount -o loop newimg/system_new.img temp_mount
 
           sudo cp -a extracted_system/. temp_mount/
 
+          sync
+
           sudo umount temp_mount
 
+      - name: Convert to Sparse
+        run: |
           img2simg newimg/system_new.img newimg/system.img
 
-      - name: Replace System IMG
+      - name: Replace Old System
         run: |
-          cp newimg/system.img work/system.img
+          cp newimg/system.img partitions/system.img
 
-      - name: Repack Super IMG
+      - name: Rebuild Super IMG
         run: |
-          cd work
+          cd partitions
+
+          SYSTEM_SIZE=$(stat -c%s system.img)
 
           lpmake \
             --metadata-size 65536 \
@@ -104,28 +165,39 @@ jobs:
             --metadata-slots 2 \
             --device super:9126805504 \
             --group main:9122611200 \
-            --partition system:readonly:$(stat -c%s system.img):main \
+            --partition system:readonly:${SYSTEM_SIZE}:main \
             --image system=system.img \
-            --output super_new.img
+            --output ../super_new.img
 
       - name: Compress Super
         run: |
-          lz4 -B6 --content-size work/super_new.img super.img.lz4
+          lz4 -B6 --content-size super_new.img super.img.lz4
 
-      - name: Create Modified AP
+      - name: Build Modified AP
         run: |
           mkdir final_ap
 
           cp extracted/* final_ap/ || true
 
           rm -f final_ap/super.img.lz4
+          rm -f final_ap/super.img
+
           mv super.img.lz4 final_ap/
 
           cd final_ap
-          tar -H ustar -cvf AP_MODDED.tar *
 
-      - name: Upload AP
+          tar -cf AP_MODDED.tar *
+
+      - name: Generate MD5
+        run: |
+          cd final_ap
+
+          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
+
+          mv AP_MODDED.tar AP_MODDED.tar.md5
+
+      - name: Upload Final AP
         uses: actions/upload-artifact@v4
         with:
           name: AP_MODDED
-          path: final_ap/AP_MODDED.tar
+          path: final_ap/AP_MODDED.tar.md5
