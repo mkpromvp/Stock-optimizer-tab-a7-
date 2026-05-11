@@ -21,8 +21,12 @@ jobs:
           sudo apt install -y \
             lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
             build-essential git zlib1g-dev liblz4-tool jq curl
+
+          # Compile simg2img
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
+
+          # Download lpunpack & lpmake
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
@@ -31,77 +35,67 @@ jobs:
 
       - name: Download & Extract Firmware
         run: |
-          mkdir -p firmware partitions
-          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -o firmware/firmware.zip
+          mkdir -p firmware partitions raw work
           cd firmware
-          # فك الضغط بذكاء لأي صيغة
-          7z x firmware.zip || true
-          AP_FILE=$(ls AP_*)
-          tar -xf "$AP_FILE" super.img.lz4 || true
-          lz4 -d super.img.lz4 super.img
-          echo "ORIGINAL_SUPER_SIZE=$(stat -c%s super.img)" >> $GITHUB_ENV
-          lpunpack --partition system super.img ../partitions/
-          cd ..
-
-      - name: Extract System & Run Debloat
-        run: |
-          simg2img partitions/system.img system_raw.img || mv partitions/system.img system_raw.img
-          mkdir -p extracted_system
-          sudo mount -o loop system_raw.img extracted_system
+          # تنزيل الملف
+          aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}"
           
-          # تشغيل السكريبت بتاعك
+          # فك ضغط ذكي (بيحل مشكلة الصورة 15536)
+          for z in *.zip; do [ -f "$z" ] && 7z x -y "$z" >/dev/null 2>&1 && rm -f "$z"; done
+          for t in *.tar.md5 *.tar; do [ -f "$t" ] && tar -xf "$t" >/dev/null 2>&1 && rm -f "$t"; done
+          
+          # فك ضغط الـ lz4 لو موجود
+          find . -name "super.img.lz4" -print0 | while IFS= read -r -d '' f; do 
+            lz4 -d "$f" ../work/super_sparse.img 2>/dev/null
+          done
+          
+          # لو الملف نزل super.img مباشرة (بدون lz4)
+          if [ ! -f "../work/super_sparse.img" ]; then
+            SUPER_FILE=$(find . -name "super.img" | head -n 1)
+            [ -n "$SUPER_FILE" ] && cp "$SUPER_FILE" ../work/super_sparse.img
+          fi
+
+      - name: Prepare Super Image
+        run: |
+          # تحويل السوبر من Sparse لـ Raw (ده بيحل خطأ الصورة 15537)
+          simg2img work/super_sparse.img work/super.img || cp work/super_sparse.img work/super.img
+          
+          ORIGINAL_SUPER=$(stat -c%s work/super.img)
+          echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER" >> $GITHUB_ENV
+          echo "Original Super Size: $ORIGINAL_SUPER bytes"
+
+          cd partitions && lpunpack ../work/super.img . && ls -lh
+
+      - name: Convert System & Mount
+        run: |
+          mkdir -p mnt extracted_system
+          # تحويل السيستم كمان احتياطياً
+          simg2img partitions/system.img raw/system_raw.img || cp partitions/system.img raw/system_raw.img
+          
+          sudo mount -o loop raw/system_raw.img mnt
+          sudo cp -a mnt/. extracted_system/
+          sudo umount mnt
+          sudo chown -R runner:runner extracted_system
+
+      - name: Run Debloat + Remove Blur
+        run: |
           chmod +x debloat.sh
+          echo "APKs before: $(find extracted_system -name "*.apk" | wc -l)"
+          
+          # تشغيل سكريبت الديبلوت
           sudo ./debloat.sh "$(pwd)/extracted_system"
+          
+          echo "=== Removing OneUI Blur ==="
+          sudo rm -rf extracted_system/system/system/lib64/*blur* 2>/dev/null || true
+          sudo rm -rf extracted_system/system/system/lib64/*gaussian* 2>/dev/null || true
+          sudo find extracted_system -name "*blur*" | sudo xargs rm -rf 2>/dev/null || true
+
+          echo "APKs after: $(find extracted_system -name "*.apk" | wc -l)"
 
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-          # الحسبة المظبوطة للحجم (الفعل + 150MB بفر)
+          # مساحة ديناميكية تمنع Error 73
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 157286400)) 
-          SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
-
-          truncate -s $SIZE newimg/system_new.img
-          mkfs.ext4 -F -b 4096 newimg/system_new.img
-          sudo mount -o loop newimg/system_new.img temp_mount
-          sudo cp -a extracted_system/. temp_mount/
-          sync
-          sudo umount temp_mount
-
-      - name: Convert to Sparse & Rebuild Super
-        run: |
-          img2simg newimg/system_new.img partitions/system.img
-          cd partitions
-          NEW_SYSTEM_SIZE=$(stat -c%s system.img)
-          
-          # حساب الجروب ليكون متوافق مع حجم السوبر الأصلي
-          lpmake \
-            --metadata-size 65536 \
-            --super-name super \
-            --metadata-slots 2 \
-            --device super:${ORIGINAL_SUPER_SIZE} \
-            --group main:$(($ORIGINAL_SUPER_SIZE - 16777216)) \
-            --partition system:readonly:${NEW_SYSTEM_SIZE}:main \
-            --image system=system.img \
-            --output ../super_new.img
-
-      - name: Compress & Final AP
-        run: |
-          lz4 -B6 --content-size super_new.img super.img.lz4
-          mkdir -p final_ap
-          mv super.img.lz4 final_ap/
-          cd final_ap
-          tar -cf AP_MODDED.tar super.img.lz4
-          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
-          mv AP_MODDED.tar AP_MODDED.tar.md5
-
-      - name: Upload Result
-        uses: actions/upload-artifact@v4
-        with:
-          name: Modded_AP
-          path: final_ap/AP_MODDED.tar.md5
-
-      - name: Upload to GoFile
-        run: |
-          SERVER=$(curl -s https://api.gofile.io/getServer | jq -r '.data.server')
-          curl -F "file=@final_ap/AP_MODDED.tar.md5" "https://$SERVER.gofile.io/uploadFile"
+          SIZE=$((SIZE + 157286400)) # إضافة 150 ميجا بفر فقط
+          SIZE=$(( (SIZE + 4
