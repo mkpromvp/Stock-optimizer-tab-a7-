@@ -21,8 +21,8 @@ jobs:
           sudo apt install -y \
             lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
             build-essential git zlib1g-dev liblz4-tool jq curl
-
-          # بناء simg2img
+          
+          # بناء أدوات simg2img
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
@@ -35,7 +35,7 @@ jobs:
 
       - name: Download & Extract Firmware
         run: |
-          mkdir -p firmware partitions raw work
+          mkdir -p firmware work partitions
           cd firmware
           aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}"
           
@@ -43,16 +43,17 @@ jobs:
           for z in *.zip; do [ -f "$z" ] && 7z x -y "$z" >/dev/null 2>&1 && rm -f "$z"; done
           for t in *.tar.md5 *.tar; do [ -f "$t" ] && tar -xf "$t" >/dev/null 2>&1 && rm -f "$t"; done
           
-          # فك ضغط super.img.lz4
-          find . -name "super.img.lz4" -exec lz4 -d {} ../work/super_sparse.img \;
-          
-          # حل مشكلة magic signature (صورة 15537): تحويل Sparse لـ Raw
-          if [ -f "../work/super_sparse.img" ]; then
+          # فك ضغط super.img.lz4 (حل مشكلة صورة 15537)
+          SUPER_LZ4=$(find . -name "super.img.lz4" | head -n 1)
+          if [ -n "$SUPER_LZ4" ]; then
+            lz4 -d "$SUPER_LZ4" ../work/super_sparse.img
+            # تحويل لـ Raw عشان lpunpack يشتغل صح
             simg2img ../work/super_sparse.img ../work/super.img || cp ../work/super_sparse.img ../work/super.img
           fi
 
       - name: Unpack Super Image
         run: |
+          # حفظ حجم السوبر الأصلي لاستخدامه لاحقاً
           ORIGINAL_SUPER=$(stat -c%s work/super.img)
           echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER" >> $GITHUB_ENV
           cd partitions && lpunpack ../work/super.img .
@@ -60,9 +61,9 @@ jobs:
       - name: Convert System & Mount
         run: |
           mkdir -p mnt extracted_system
-          # تحويل system.img لـ Raw قبل النسخ
-          simg2img partitions/system.img raw/system_raw.img || cp partitions/system.img raw/system_raw.img
-          sudo mount -o loop raw/system_raw.img mnt
+          # تحويل البارتيشن لـ Raw قبل التعامل معاه
+          simg2img partitions/system.img partitions/system_raw.img || cp partitions/system.img partitions/system_raw.img
+          sudo mount -o loop partitions/system_raw.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
           sudo chown -R runner:runner extracted_system
@@ -72,35 +73,31 @@ jobs:
           chmod +x debloat.sh
           # تشغيل السكريبت بتاعك زي ما هو
           sudo ./debloat.sh "$(pwd)/extracted_system"
-          
-          # تنظيف إضافي للبلور (اختياري)
-          sudo find extracted_system -name "*blur*" -exec rm -rf {} + 2>/dev/null || true
 
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-          # حل مشكلة No Space Left (صورة 15542): إضافة 300MB buffer ثابتة
-          SIZE=$(sudo du -sb extracted_system | cut -f1)
-          BUFFER=$((300 * 1024 * 1024))
-          TOTAL_SIZE=$((SIZE + BUFFER))
-          # التقريب لبلوكات 4096
-          TOTAL_SIZE=$(( (TOTAL_SIZE / 4096 + 1) * 4096 ))
+          # حل مشكلة No Space (صورة 15542): حساب المساحة بدقة + 250MB احتياطي
+          DIR_SIZE=$(sudo du -sb extracted_system | cut -f1)
+          BUFFER=$((250 * 1024 * 1024))
+          RAW_SIZE=$((DIR_SIZE + BUFFER))
+          # التقريب لبلوكات 4096 (مهم جداً للـ lpmake)
+          FINAL_SIZE=$(( (RAW_SIZE + 4095) / 4096 * 4096 ))
+          
+          echo "FINAL_SYSTEM_SIZE=$FINAL_SIZE" >> $GITHUB_ENV
 
-          truncate -s $TOTAL_SIZE newimg/system_new.img
-          mkfs.ext4 -F -b 4096 newimg/system_new.img
+          truncate -s $FINAL_SIZE newimg/system_mod.img
+          mkfs.ext4 -F -b 4096 newimg/system_mod.img
 
-          sudo mount -o loop newimg/system_new.img temp_mount
+          sudo mount -o loop newimg/system_mod.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
           sync
           sudo umount temp_mount
 
-      - name: Build New Super (Fix Size Mismatch)
+      - name: Build New Super (The Fix for Exit 73)
         run: |
-          # تحويل الـ img الجديد لـ Sparse
-          img2simg newimg/system_new.img partitions/system_final.img
-          
-          # حل مشكلة exit code 73 (صورة 15549): قياس حجم الملف الفعلي بالبايت
-          FINAL_SYSTEM_SIZE=$(stat -c%s partitions/system_final.img)
+          # هنا السر: هنستخدم الملف الـ RAW مباشرة وحجمه الـ RAW
+          # ده بيمنع أي لخبطة في الحسابات عند lpmake
           
           # حساب حجم الجروب (السوبر - 16MB للهيدر)
           GROUP_SIZE=$(($ORIGINAL_SUPER_SIZE - 16777216))
@@ -112,14 +109,15 @@ jobs:
             --device super:${ORIGINAL_SUPER_SIZE} \
             --group main:${GROUP_SIZE} \
             --partition system:readonly:${FINAL_SYSTEM_SIZE}:main \
-            --image system=partitions/system_final.img \
+            --image system=newimg/system_mod.img \
             --output super_new.img
 
-      - name: Compress & Finalize AP
+      - name: Compress & Final AP
         run: |
+          # ضغط السوبر النهائي لتقليل الحجم
           lz4 -B6 --content-size super_new.img super.img.lz4
           mkdir -p final_ap
-          # نسخ ملفات الـ Firmware الأصلية الضرورية للإقلاع (مثل vbmeta)
+          # نسخ ملفات الفيرموير الأصلية المتبقية
           cp firmware/*.img final_ap/ 2>/dev/null || true
           mv super.img.lz4 final_ap/
           cd final_ap
@@ -127,9 +125,9 @@ jobs:
           md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
 
-      - name: Upload Link
+      - name: Upload Result
         run: |
-          FILE="final_ap/AP_MODDED.tar.md5"
+          FILE=$(find final_ap -name "*.tar.md5")
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
           LINK=$(curl -# -F "file=@$FILE" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "🔗 رابط التحميل النهائي: $LINK"
+          echo "🔗 رابط التحميل الجديد: $LINK"
