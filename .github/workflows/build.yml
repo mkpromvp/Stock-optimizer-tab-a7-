@@ -28,30 +28,36 @@ jobs:
             android-sdk-libsparse-utils \
             build-essential \
             git \
-            zlib1g-dev
+            zlib1g-dev \
+            liblz4-tool
 
-          # Compile simg2img and img2simg (الحل النهائي لـ Ubuntu 24.04)
+          # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img
-          make
+          make -j$(nproc)
           sudo cp simg2img img2simg /usr/local/bin/
           cd ..
 
-      - name: Download lpunpack & lpmake
+      - name: Download lpunpack & lpmake (من الريبو بتاعك)
         run: |
           mkdir -p bin
           cd bin
-          wget -q https://github.com/LonelyFool/lpunpack_and_lpmake/releases/latest/download/lpunpack -O lpunpack
-          wget -q https://github.com/LonelyFool/lpunpack_and_lpmake/releases/latest/download/lpmake -O lpmake
+
+          # تحميل الأدوات من ريبو SReStocker (أكثر استقراراً)
+          wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
+          wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
+
           chmod +x lpunpack lpmake
           sudo mv lpunpack lpmake /usr/local/bin/
+
+          echo "✅ lpunpack & lpmake installed successfully"
 
       - name: Download Firmware
         run: |
           mkdir -p firmware
           cd firmware
-          echo "Downloading: ${{ github.event.inputs.firmware_url }}"
-          aria2c -x16 -s16 --timeout=90 --connect-timeout=30 "${{ github.event.inputs.firmware_url }}"
+          echo "Downloading firmware: ${{ github.event.inputs.firmware_url }}"
+          aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
 
       - name: Extract AP
         run: |
@@ -101,7 +107,7 @@ jobs:
         run: |
           mkdir -p newimg temp_mount
           SIZE=$(du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 2147483648))   # +2GB
+          SIZE=$((SIZE + 2147483648))  # +2GB
           echo "Final System Size = $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F newimg/system_new.img
@@ -122,6 +128,7 @@ jobs:
         run: |
           cd partitions
           SYSTEM_SIZE=$(stat -c%s system.img)
+
           lpmake \
             --metadata-size 65536 \
             --super-name super \
