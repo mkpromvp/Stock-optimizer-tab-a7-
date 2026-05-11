@@ -55,7 +55,7 @@ jobs:
             fi
           done
 
-          echo "=== Extracting tar.md5 ==="
+          echo "=== Extracting tar.md5 files ==="
           for tarfile in *.tar.md5 *.tar; do
             if [ -f "$tarfile" ]; then
               echo "Extracting $tarfile"
@@ -64,18 +64,21 @@ jobs:
             fi
           done
 
-          echo "=== Decompressing .lz4 files ==="
+          echo "=== Decompressing .lz4 files (Safe Mode) ==="
+          # طريقة أكثر أمانًا - فقط الملفات المهمة
           for lz4file in *.lz4; do
             if [ -f "$lz4file" ]; then
-              echo "Decompressing $lz4file"
-              lz4 -d "\( lz4file" " \){lz4file%.lz4}" >/dev/null 2>&1
+              echo "Decompressing: $lz4file"
+              # نجرب decompress بدون إيقاف الـ script لو فشل ملف واحد
+              lz4 -d "\( lz4file" " \){lz4file%.lz4}" 2>/dev/null || echo "Warning: Failed to decompress $lz4file"
               rm -f "$lz4file"
             fi
           done
 
-          echo "=== Extracted Files ==="
+          echo "=== Final Extracted Files ==="
           ls -lh
-          find . -name "*super*" -ls
+          echo "Super files:"
+          find . -name "*super*" -ls || true
 
       - name: Locate and Decompress SUPER
         run: |
@@ -84,12 +87,13 @@ jobs:
           SUPER_RAW=$(find firmware -name "super.img" | head -n 1)
 
           if [ -n "$SUPER_LZ4" ]; then
-            echo "Decompressing $SUPER_LZ4"
+            echo "Found super.img.lz4 → Decompressing..."
             lz4 -d "$SUPER_LZ4" work/super.img
           elif [ -n "$SUPER_RAW" ]; then
+            echo "Found super.img"
             cp "$SUPER_RAW" work/super.img
           else
-            echo "❌ super.img not found!"
+            echo "❌ super.img not found! Check extraction above."
             exit 1
           fi
 
@@ -171,7 +175,7 @@ jobs:
         run: |
           FILE="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          echo "Uploading to GoFile.io server: $SERVER ..."
+          echo "Uploading to GoFile.io ($SERVER)..."
           LINK=$(curl -# -F "file=@\( FILE" "https:// \){SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "✅ Upload Completed!"
-          echo "Download Link: $LINK"
+          echo "✅ Upload Successful!"
+          echo "🔗 Download Link: $LINK"
