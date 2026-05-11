@@ -18,16 +18,12 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            lz4 p7zip-full zip unzip aria2 e2fsprogs \
-            android-sdk-libsparse-utils build-essential git \
-            zlib1g-dev liblz4-tool jq curl
+          sudo apt install -y lz4 p7zip-full zip unzip aria2 e2fsprogs \
+            android-sdk-libsparse-utils build-essential git zlib1g-dev liblz4-tool jq curl
 
-          # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-          # lpunpack & lpmake
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
@@ -40,16 +36,20 @@ jobs:
           aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}"
           for z in *.zip; do [ -f "$z" ] && 7z x -y "$z" >/dev/null 2>&1 && rm -f "$z"; done
           for t in *.tar.md5 *.tar; do [ -f "$t" ] && tar -xf "$t" >/dev/null 2>&1 && rm -f "$t"; done
-          find . -name "*.lz4" -print0 | while IFS= read -r -d '' f; do 
-            lz4 -d "\( f" " \){f%.lz4}" 2>/dev/null && rm -f "$f" || rm -f "$f"
-          done
+          find . -name "*.lz4" -print0 | while IFS= read -r -d '' f; do lz4 -d "\( f" " \){f%.lz4}" 2>/dev/null && rm -f "$f" || rm -f "$f"; done
 
-      - name: Prepare Super Image
+      - name: Prepare Super Image & Get Original Sizes
         run: |
           mkdir -p work partitions raw
           SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
           [ -n "$SUPER_LZ4" ] && lz4 -d "$SUPER_LZ4" work/super_sparse.img
           simg2img work/super_sparse.img work/super.img 2>/dev/null || cp work/super_sparse.img work/super.img
+
+          # حفظ حجم Super الأصلي
+          ORIGINAL_SUPER_SIZE=$(stat -c%s work/super.img)
+          echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER_SIZE" >> $GITHUB_ENV
+          echo "Original Super Size: $ORIGINAL_SUPER_SIZE bytes"
+
           cd partitions && lpunpack ../work/super.img . && ls -lh
 
       - name: Convert System & Mount
@@ -64,34 +64,24 @@ jobs:
       - name: Run Debloat + Remove Blur
         run: |
           chmod +x debloat.sh
-          
-          echo "=== Before Debloat ==="
           echo "APKs before: $(find extracted_system -name "*.apk" | wc -l)"
-          
-          ./debloat.sh extracted_system | tee debloat.log
+          ./debloat.sh extracted_system
           
           echo "=== Removing OneUI Blur ==="
-          rm -rf extracted_system/system/system/lib64/libblur* 2>/dev/null || true
+          rm -rf extracted_system/system/system/lib64/*blur* 2>/dev/null || true
           rm -rf extracted_system/system/system/lib64/*gaussian* 2>/dev/null || true
-          rm -rf extracted_system/product/etc/permissions/*blur* 2>/dev/null || true
-          find extracted_system -name "*blur*" -o -name "*gaussian*" | xargs rm -rf 2>/dev/null || true
+          find extracted_system -name "*blur*" | xargs rm -rf 2>/dev/null || true
           
-          # Disable Blur via build.prop
-          echo "ro.surface_flinger.force_hwc_copy_for_virtual_displays=1" >> extracted_system/system/build.prop
-          echo "ro.sf.blurs_are_expensive=0" >> extracted_system/system/build.prop
-          echo "debug.hwui.render_thread=1" >> extracted_system/system/build.prop
-          
-          echo "=== After Debloat ==="
           echo "APKs after: $(find extracted_system -name "*.apk" | wc -l)"
-          echo "Size: $(du -sh extracted_system | cut -f1)"
 
-      - name: Create New System IMG
+      - name: Create New System IMG (Conservative Size)
         run: |
           mkdir -p newimg temp_mount
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 4294967296))  # +4GB
+          SIZE=$((SIZE + 2147483648))   # +2GB فقط (مش +5)
           SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
 
+          echo "Creating system.img with size: $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F -b 4096 newimg/system_new.img
 
@@ -100,7 +90,7 @@ jobs:
           sync
           sudo umount temp_mount
 
-      - name: Convert to Sparse & Rebuild Super
+      - name: Convert to Sparse & Rebuild Super (Keep Original Size)
         run: |
           img2simg newimg/system_new.img newimg/system.img
           cp newimg/system.img partitions/system.img
@@ -108,12 +98,14 @@ jobs:
           cd partitions
           NEW_SYSTEM_SIZE=$(stat -c%s system.img)
 
+          echo "Rebuilding with original super size: $ORIGINAL_SUPER_SIZE"
+
           lpmake \
             --metadata-size 65536 \
             --super-name super \
             --metadata-slots 2 \
-            --device super:9126805504 \
-            --group main:9122611200 \
+            --device super:${ORIGINAL_SUPER_SIZE} \
+            --group main:$(($ORIGINAL_SUPER_SIZE - 4194304)) \
             --partition system:readonly:${NEW_SYSTEM_SIZE}:main \
             --image system=system.img \
             --output ../super_new.img
@@ -134,4 +126,4 @@ jobs:
           FILE="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
           LINK=$(curl -# -F "file=@\( FILE" "https:// \){SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "🔗 Download Link: $LINK"
+          echo "🔗 $LINK"
