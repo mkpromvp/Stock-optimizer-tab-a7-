@@ -21,7 +21,7 @@ jobs:
           sudo apt install -y \
             lz4 p7zip-full zip unzip aria2 e2fsprogs \
             android-sdk-libsparse-utils build-essential git \
-            zlib1g-dev liblz4-tool
+            zlib1g-dev liblz4-tool jq curl
 
           # simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
@@ -42,11 +42,11 @@ jobs:
           echo "Downloading: ${{ github.event.inputs.firmware_url }}"
           aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
 
-      - name: Full Firmware Extraction (ZIP + tar.md5 + lz4)
+      - name: Full Firmware Extraction
         run: |
           cd firmware
 
-          echo "=== Extracting ZIP files ==="
+          echo "=== Extracting ZIP ==="
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
               echo "Extracting $zipfile"
@@ -55,7 +55,7 @@ jobs:
             fi
           done
 
-          echo "=== Extracting tar.md5 files ==="
+          echo "=== Extracting tar.md5 ==="
           for tarfile in *.tar.md5 *.tar; do
             if [ -f "$tarfile" ]; then
               echo "Extracting $tarfile"
@@ -64,7 +64,7 @@ jobs:
             fi
           done
 
-          echo "=== Decompressing all .lz4 files ==="
+          echo "=== Decompressing .lz4 files ==="
           for lz4file in *.lz4; do
             if [ -f "$lz4file" ]; then
               echo "Decompressing $lz4file"
@@ -73,27 +73,23 @@ jobs:
             fi
           done
 
-          echo "=== Extracted files ==="
+          echo "=== Extracted Files ==="
           ls -lh
-          echo "Looking for super.img..."
           find . -name "*super*" -ls
 
       - name: Locate and Decompress SUPER
         run: |
           mkdir -p work
-
           SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
           SUPER_RAW=$(find firmware -name "super.img" | head -n 1)
 
           if [ -n "$SUPER_LZ4" ]; then
-            echo "Found: $SUPER_LZ4"
+            echo "Decompressing $SUPER_LZ4"
             lz4 -d "$SUPER_LZ4" work/super.img
           elif [ -n "$SUPER_RAW" ]; then
-            echo "Found: $SUPER_RAW"
             cp "$SUPER_RAW" work/super.img
           else
-            echo "❌ super.img.lz4 or super.img not found!"
-            find firmware -name "*.img*" | head -10
+            echo "❌ super.img not found!"
             exit 1
           fi
 
@@ -134,7 +130,7 @@ jobs:
           sync
           sudo umount temp_mount
 
-      - name: Convert to Sparse & Rebuild
+      - name: Convert to Sparse & Rebuild Super
         run: |
           img2simg newimg/system_new.img newimg/system.img
           cp newimg/system.img partitions/system.img
@@ -171,8 +167,11 @@ jobs:
           md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
 
-      - name: Upload Final AP
-        uses: actions/upload-artifact@v4
-        with:
-          name: AP_MODDED
-          path: final_ap/AP_MODDED.tar.md5
+      - name: Upload to GoFile.io
+        run: |
+          FILE="final_ap/AP_MODDED.tar.md5"
+          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          echo "Uploading to GoFile.io server: $SERVER ..."
+          LINK=$(curl -# -F "file=@\( FILE" "https:// \){SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
+          echo "✅ Upload Completed!"
+          echo "Download Link: $LINK"
