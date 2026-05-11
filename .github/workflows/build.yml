@@ -1,0 +1,131 @@
+name: Samsung Stock ROM Debloat Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Direct firmware/AP file link"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            lz4 p7zip-full android-sdk-libsparse-utils \
+            simg2img img2simg zip unzip aria2
+
+      - name: Download Firmware
+        run: |
+          mkdir firmware
+          cd firmware
+          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}"
+
+      - name: Extract AP TAR
+        run: |
+          mkdir extracted
+          APFILE=$(find firmware -name "AP*.tar.md5" -o -name "AP*.tar")
+          
+          cp "$APFILE" ap.tar
+          tar -xf ap.tar -C extracted
+
+      - name: Extract SUPER IMG
+        run: |
+          mkdir work
+          cd extracted
+
+          if [ -f super.img.lz4 ]; then
+            lz4 -d super.img.lz4 super.img
+          fi
+
+          mv super.img ../work/
+
+      - name: Unpack Super
+        run: |
+          cd work
+
+          lpunpack super.img .
+
+          mkdir system_raw
+
+          simg2img system.img system_raw/system_raw.img
+
+      - name: Mount System
+        run: |
+          mkdir mnt
+          sudo mount -o loop work/system_raw/system_raw.img mnt
+
+      - name: Copy System RW
+        run: |
+          mkdir extracted_system
+          sudo cp -a mnt/. extracted_system/
+          sudo umount mnt
+
+      - name: Run Debloat Script
+        run: |
+          chmod +x debloat.sh
+          ./debloat.sh extracted_system
+
+      - name: Repack System IMG
+        run: |
+          mkdir newimg
+
+          dd if=/dev/zero of=newimg/system_new.img bs=1M count=8192
+
+          mkfs.ext4 -F newimg/system_new.img
+
+          mkdir temp_mount
+          sudo mount -o loop newimg/system_new.img temp_mount
+
+          sudo cp -a extracted_system/. temp_mount/
+
+          sudo umount temp_mount
+
+          img2simg newimg/system_new.img newimg/system.img
+
+      - name: Replace System IMG
+        run: |
+          cp newimg/system.img work/system.img
+
+      - name: Repack Super IMG
+        run: |
+          cd work
+
+          lpmake \
+            --metadata-size 65536 \
+            --super-name super \
+            --metadata-slots 2 \
+            --device super:9126805504 \
+            --group main:9122611200 \
+            --partition system:readonly:$(stat -c%s system.img):main \
+            --image system=system.img \
+            --output super_new.img
+
+      - name: Compress Super
+        run: |
+          lz4 -B6 --content-size work/super_new.img super.img.lz4
+
+      - name: Create Modified AP
+        run: |
+          mkdir final_ap
+
+          cp extracted/* final_ap/ || true
+
+          rm -f final_ap/super.img.lz4
+          mv super.img.lz4 final_ap/
+
+          cd final_ap
+          tar -H ustar -cvf AP_MODDED.tar *
+
+      - name: Upload AP
+        uses: actions/upload-artifact@v4
+        with:
+          name: AP_MODDED
+          path: final_ap/AP_MODDED.tar
