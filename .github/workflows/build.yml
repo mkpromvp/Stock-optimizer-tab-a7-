@@ -21,10 +21,10 @@ jobs:
           sudo apt install -y \
             lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
             build-essential git zlib1g-dev liblz4-tool jq curl
-
+          # بناء أدوات تحويل الصور
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
-
+          # تحميل أدوات البارتيشنز
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
@@ -43,13 +43,14 @@ jobs:
           AP_FILE=$(ls AP_*)
           tar -xf "$AP_FILE" super.img.lz4 || true
           lz4 -d super.img.lz4 super.img
-          ORIGINAL_SUPER_SIZE=$(stat -c%s super.img)
-          echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER_SIZE" >> $GITHUB_ENV
+          # حفظ حجم السوبر الأصلي لاستخدامه في البناء
+          echo "ORIGINAL_SUPER_SIZE=$(stat -c%s super.img)" >> $GITHUB_ENV
           lpunpack --partition system super.img ../partitions/
           cd ..
 
       - name: Extract System & Run Debloat
         run: |
+          # التأكد من تحويل الصورة لـ Raw قبل الـ Mount
           simg2img partitions/system.img system_raw.img || mv partitions/system.img system_raw.img
           mkdir -p extracted_system
           sudo mount -o loop system_raw.img extracted_system
@@ -57,12 +58,12 @@ jobs:
           chmod +x debloat.sh
           sudo ./debloat.sh "$(pwd)/extracted_system"
 
-      - name: Create New System IMG
+      - name: Create New System IMG (QuantumROM Method)
         run: |
           mkdir -p newimg temp_mount
-          # تصحيح الحجم: إضافة 500 ميجا بدل 2 جيجا عشان ملف السوبر ميفشلش
+          # حساب الحجم الفعلي للملفات + 300MB مساحة عمل (Buffer)
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 524288000)) 
+          SIZE=$((SIZE + 314572800)) 
           SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
 
           truncate -s $SIZE newimg/system_new.img
@@ -79,13 +80,15 @@ jobs:
           cd partitions
           NEW_SYSTEM_SIZE=$(stat -c%s system.img)
           
-          # حساب حجم الجروب بدقة ليتناسب مع جهازك
+          # حساب حجم الجروب (السوبر - 16 ميجا للميتا داتا)
+          GROUP_SIZE=$(($ORIGINAL_SUPER_SIZE - 16777216))
+
           lpmake \
             --metadata-size 65536 \
             --super-name super \
             --metadata-slots 2 \
             --device super:${ORIGINAL_SUPER_SIZE} \
-            --group main:$(($ORIGINAL_SUPER_SIZE - 8388608)) \
+            --group main:${GROUP_SIZE} \
             --partition system:readonly:${NEW_SYSTEM_SIZE}:main \
             --image system=system.img \
             --output ../super_new.img
@@ -111,29 +114,3 @@ jobs:
           FILE_PATH="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/getServer | jq -r '.data.server')
           curl -F "file=@$FILE_PATH" "https://$SERVER.gofile.io/uploadFile"
-            --metadata-size 65536 \
-            --super-name super \
-            --metadata-slots 2 \
-            --device super:${ORIGINAL_SUPER_SIZE} \
-            --group main:$(($ORIGINAL_SUPER_SIZE - 8388608)) \
-            --partition system:readonly:${NEW_SYSTEM_SIZE}:main \
-            --image system=system.img \
-            --output ../super_new.img
-
-      - name: Compress & Final AP
-        run: |
-          lz4 -B6 --content-size super_new.img super.img.lz4
-          mkdir -p final_ap
-          cp firmware/* final_ap/ 2>/dev/null || true
-          mv super.img.lz4 final_ap/
-          cd final_ap
-          tar -cf AP_MODDED.tar *
-          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
-          mv AP_MODDED.tar AP_MODDED.tar.md5
-
-      - name: Upload to GoFile.io
-        run: |
-          FILE="final_ap/AP_MODDED.tar.md5"
-          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          LINK=$(curl -# -F "file=@\( FILE" "https:// \){SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "🔗 $LINK"
