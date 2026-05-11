@@ -18,107 +18,68 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            lz4 p7zip-full zip unzip aria2 e2fsprogs \
-            android-sdk-libsparse-utils build-essential git \
-            zlib1g-dev liblz4-tool jq curl
+          sudo apt install -y lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils build-essential git zlib1g-dev liblz4-tool jq curl
 
-          # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-          # lpunpack & lpmake
-          mkdir -p bin
-          cd bin
+          mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
           chmod +x lpunpack lpmake
           sudo mv lpunpack lpmake /usr/local/bin/
 
-      - name: Download Firmware
+      - name: Download & Extract Firmware
         run: |
-          mkdir -p firmware
-          cd firmware
-          echo "Downloading: ${{ github.event.inputs.firmware_url }}"
-          aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
+          mkdir -p firmware && cd firmware
+          aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}"
+          for zipfile in *.zip; do [ -f "$zipfile" ] && 7z x -y "$zipfile" >/dev/null 2>&1 && rm -f "$zipfile"; done
+          for tarfile in *.tar.md5 *.tar; do [ -f "$tarfile" ] && tar -xf "$tarfile" >/dev/null 2>&1 && rm -f "$tarfile"; done
+          find . -name "*.lz4" -print0 | while IFS= read -r -d '' f; do lz4 -d "\( f" " \){f%.lz4}" 2>/dev/null && rm -f "$f" || rm -f "$f"; done
 
-      - name: Full Firmware Extraction
+      - name: Prepare Super & Extract Partitions
         run: |
-          cd firmware
-          echo "=== Extracting ZIP ==="
-          for zipfile in *.zip; do
-            if [ -f "$zipfile" ]; then
-              7z x -y "$zipfile" >/dev/null 2>&1 && rm -f "$zipfile"
-            fi
-          done
-
-          echo "=== Extracting tar.md5 ==="
-          for tarfile in *.tar.md5 *.tar; do
-            if [ -f "$tarfile" ]; then
-              tar -xf "$tarfile" >/dev/null 2>&1 && rm -f "$tarfile"
-            fi
-          done
-
-          echo "=== Decompressing .lz4 files ==="
-          find . -name "*.lz4" -print0 | while IFS= read -r -d '' lz4file; do
-            if [ -f "$lz4file" ]; then
-              outfile="${lz4file%.lz4}"
-              lz4 -d "$lz4file" "$outfile" 2>/dev/null && rm -f "$lz4file" || rm -f "$lz4file"
-            fi
-          done
-
-      - name: Prepare Super Image
-        run: |
-          mkdir -p work
+          mkdir -p work partitions raw
           SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
-          SUPER_SPARSE=$(find firmware -name "super.img" | head -n 1)
-
-          if [ -n "$SUPER_LZ4" ]; then
-            lz4 -d "$SUPER_LZ4" work/super_sparse.img
-          elif [ -n "$SUPER_SPARSE" ]; then
-            cp "$SUPER_SPARSE" work/super_sparse.img
-          else
-            echo "❌ super.img not found!" && exit 1
-          fi
-
+          [ -n "$SUPER_LZ4" ] && lz4 -d "$SUPER_LZ4" work/super_sparse.img
           simg2img work/super_sparse.img work/super.img
-          echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
+          cd partitions && lpunpack ../work/super.img . && ls -lh
 
-      - name: Extract Dynamic Partitions
+      - name: Convert System & Mount
         run: |
-          mkdir -p partitions
-          cd partitions
-          lpunpack ../work/super.img .
-          ls -lh
-
-      - name: Convert System IMG to Raw
-        run: |
-          mkdir -p raw
           simg2img partitions/system.img raw/system_raw.img || cp partitions/system.img raw/system_raw.img
-
-      - name: Mount and Copy System
-        run: |
           mkdir -p mnt extracted_system
           sudo mount -o loop raw/system_raw.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
           sudo chown -R runner:runner extracted_system
 
-      - name: Run Debloat Script
+      # ====================== التحقق من الديبلوت ======================
+      - name: Run Debloat Script + Verification
         run: |
+          echo "=== Before Debloat ==="
+          echo "System apps count: $(find extracted_system -type d -name "app" | xargs -I {} find {} -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Priv-app count: $(find extracted_system -type d -name "priv-app" | xargs -I {} find {} -mindepth 1 -maxdepth 1 -type d | wc -l)"
+
           chmod +x debloat.sh
-          ./debloat.sh extracted_system
+          echo "Running debloat.sh ..."
+          ./debloat.sh extracted_system | tee debloat.log
+
+          echo "=== After Debloat ==="
+          echo "System apps count: $(find extracted_system -type d -name "app" | xargs -I {} find {} -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Priv-app count: $(find extracted_system -type d -name "priv-app" | xargs -I {} find {} -mindepth 1 -maxdepth 1 -type d | wc -l)"
+
+          echo "=== Debloat Log Summary ==="
+          grep -E "Debloating|Removing|Deleting|KICK" debloat.log || echo "No clear log output from script"
+          echo "Total removed items approx: $(grep -c "rm -rf" debloat.log || echo "unknown")"
 
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-
-          # حل المشكلة: حجم أكبر + alignment
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 4294967296))  # +4GB
-          SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))  # Align to 4KB
+          SIZE=$((SIZE + 4294967296))
+          SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
 
-          echo "Final System Size = $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F -b 4096 newimg/system_new.img
 
@@ -126,17 +87,14 @@ jobs:
           sudo cp -a extracted_system/. temp_mount/
           sync
           sudo umount temp_mount
-          sudo chown -R runner:runner newimg
 
       - name: Convert to Sparse & Rebuild Super
         run: |
-          echo "Converting to sparse image..."
           img2simg newimg/system_new.img newimg/system.img
-
           cp newimg/system.img partitions/system.img
 
           cd partitions
-          SYSTEM_SIZE=$(stat -c%s system.img)
+          NEW_SYSTEM_SIZE=$(stat -c%s system.img)
 
           lpmake \
             --metadata-size 65536 \
@@ -144,34 +102,22 @@ jobs:
             --metadata-slots 2 \
             --device super:9126805504 \
             --group main:9122611200 \
-            --partition system:readonly:${SYSTEM_SIZE}:main \
+            --partition system:readonly:${NEW_SYSTEM_SIZE}:main \
             --image system=system.img \
             --output ../super_new.img
 
-      - name: Compress Super
+      - name: Compress & Build Final AP
         run: |
           lz4 -B6 --content-size super_new.img super.img.lz4
-
-      - name: Build Modified AP
-        run: |
           mkdir -p final_ap
           cp firmware/* final_ap/ 2>/dev/null || true
-          rm -f final_ap/super.img.lz4 final_ap/super.img
           mv super.img.lz4 final_ap/
-          cd final_ap
-          tar -cf AP_MODDED.tar *
-
-      - name: Generate MD5
-        run: |
-          cd final_ap
-          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
-          mv AP_MODDED.tar AP_MODDED.tar.md5
+          cd final_ap && tar -cf AP_MODDED.tar *
+          cd final_ap && md5sum -t AP_MODDED.tar >> AP_MODDED.tar && mv AP_MODDED.tar AP_MODDED.tar.md5
 
       - name: Upload to GoFile.io
         run: |
           FILE="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          echo "Uploading to GoFile.io ($SERVER)..."
           LINK=$(curl -# -F "file=@\( FILE" "https:// \){SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "✅ Upload Successful!"
-          echo "🔗 Download Link: $LINK"
+          echo "🔗 $LINK"
