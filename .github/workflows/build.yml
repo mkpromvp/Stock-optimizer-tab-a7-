@@ -64,46 +64,46 @@ jobs:
             fi
           done
 
-          echo "=== Decompressing .lz4 files (Fixed) ==="
-          # طريقة أفضل وأكثر أمانًا
+          echo "=== Decompressing .lz4 files ==="
           find . -name "*.lz4" -print0 | while IFS= read -r -d '' lz4file; do
             if [ -f "$lz4file" ]; then
               outfile="${lz4file%.lz4}"
-              echo "Decompressing: $lz4file → $outfile"
+              echo "Decompressing: $lz4file"
               if lz4 -d "$lz4file" "$outfile" 2>/dev/null; then
                 rm -f "$lz4file"
-                echo "✓ Success: $outfile"
+                echo "✓ $outfile"
               else
-                echo "⚠️ Failed: $lz4file (may not be standard lz4)"
+                echo "⚠️ Failed $lz4file"
                 rm -f "$lz4file"
               fi
             fi
           done
 
-          echo "=== Final Extracted Files ==="
+          echo "=== Extracted Files ==="
           ls -lh
-          echo "Super files found:"
+          echo "Super files:"
           find . -name "*super*" -ls || true
 
-      - name: Locate and Decompress SUPER
+      - name: Prepare Super Image (Critical Fix)
         run: |
           mkdir -p work
           SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
-          SUPER_RAW=$(find firmware -name "super.img" | head -n 1)
+          SUPER_SPARSE=$(find firmware -name "super.img" | head -n 1)
 
           if [ -n "$SUPER_LZ4" ]; then
-            echo "Decompressing super.img.lz4 ..."
-            lz4 -d "$SUPER_LZ4" work/super.img
-          elif [ -n "$SUPER_RAW" ]; then
-            cp "$SUPER_RAW" work/super.img
+            lz4 -d "$SUPER_LZ4" work/super_sparse.img
+          elif [ -n "$SUPER_SPARSE" ]; then
+            cp "$SUPER_SPARSE" work/super_sparse.img
           else
             echo "❌ super.img not found!"
-            ls -R firmware | grep -E "(super|img)" || true
             exit 1
           fi
 
+          echo "Converting sparse super.img to raw..."
+          simg2img work/super_sparse.img work/super.img
+
           if [ ! -f work/super.img ]; then
-            echo "❌ Failed to create super.img"
+            echo "❌ Failed to convert super.img"
             exit 1
           fi
           echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
@@ -118,7 +118,7 @@ jobs:
       - name: Convert System IMG to Raw
         run: |
           mkdir -p raw
-          simg2img partitions/system.img raw/system_raw.img
+          simg2img partitions/system.img raw/system_raw.img || cp partitions/system.img raw/system_raw.img
 
       - name: Mount and Copy System
         run: |
