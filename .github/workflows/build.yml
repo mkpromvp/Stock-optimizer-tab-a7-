@@ -23,7 +23,7 @@ jobs:
             android-sdk-libsparse-utils build-essential git \
             zlib1g-dev liblz4-tool jq curl
 
-          # simg2img & img2simg
+          # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
@@ -64,20 +64,25 @@ jobs:
             fi
           done
 
-          echo "=== Decompressing .lz4 files (Safe Mode) ==="
-          # طريقة أكثر أمانًا - فقط الملفات المهمة
-          for lz4file in *.lz4; do
+          echo "=== Decompressing .lz4 files (Fixed) ==="
+          # طريقة أفضل وأكثر أمانًا
+          find . -name "*.lz4" -print0 | while IFS= read -r -d '' lz4file; do
             if [ -f "$lz4file" ]; then
-              echo "Decompressing: $lz4file"
-              # نجرب decompress بدون إيقاف الـ script لو فشل ملف واحد
-              lz4 -d "\( lz4file" " \){lz4file%.lz4}" 2>/dev/null || echo "Warning: Failed to decompress $lz4file"
-              rm -f "$lz4file"
+              outfile="${lz4file%.lz4}"
+              echo "Decompressing: $lz4file → $outfile"
+              if lz4 -d "$lz4file" "$outfile" 2>/dev/null; then
+                rm -f "$lz4file"
+                echo "✓ Success: $outfile"
+              else
+                echo "⚠️ Failed: $lz4file (may not be standard lz4)"
+                rm -f "$lz4file"
+              fi
             fi
           done
 
           echo "=== Final Extracted Files ==="
           ls -lh
-          echo "Super files:"
+          echo "Super files found:"
           find . -name "*super*" -ls || true
 
       - name: Locate and Decompress SUPER
@@ -87,15 +92,21 @@ jobs:
           SUPER_RAW=$(find firmware -name "super.img" | head -n 1)
 
           if [ -n "$SUPER_LZ4" ]; then
-            echo "Found super.img.lz4 → Decompressing..."
+            echo "Decompressing super.img.lz4 ..."
             lz4 -d "$SUPER_LZ4" work/super.img
           elif [ -n "$SUPER_RAW" ]; then
-            echo "Found super.img"
             cp "$SUPER_RAW" work/super.img
           else
-            echo "❌ super.img not found! Check extraction above."
+            echo "❌ super.img not found!"
+            ls -R firmware | grep -E "(super|img)" || true
             exit 1
           fi
+
+          if [ ! -f work/super.img ]; then
+            echo "❌ Failed to create super.img"
+            exit 1
+          fi
+          echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
 
       - name: Extract Dynamic Partitions
         run: |
