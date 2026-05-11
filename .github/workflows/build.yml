@@ -1,4 +1,4 @@
-name: Samsung Stock ROM Debloat Builder
+name: Samsung Stock ROM Customizer
 
 on:
   workflow_dispatch:
@@ -18,47 +18,31 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
-            build-essential git zlib1g-dev liblz4-tool jq curl
-          
-          # بناء أدوات simg2img
+          sudo apt install -y lz4 p7zip-full aria2 e2fsprogs android-sdk-libsparse-utils build-essential git liblz4-tool jq curl
+          # بناء أدوات تحويل الصور
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
-
-          # تحميل أدوات lpunpack/lpmake
+          # تحميل أدوات السوبر
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
           chmod +x lpunpack lpmake
           sudo mv lpunpack lpmake /usr/local/bin/
 
-      - name: Download & Extract Firmware
+      - name: Download & Prepare Super
         run: |
           mkdir -p firmware work partitions
-          cd firmware
-          aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}"
-          
-          # فك الضغط (ZIP أو TAR)
-          for z in *.zip; do [ -f "$z" ] && 7z x -y "$z" >/dev/null 2>&1 && rm -f "$z"; done
-          for t in *.tar.md5 *.tar; do [ -f "$t" ] && tar -xf "$t" >/dev/null 2>&1 && rm -f "$t"; done
-          
-          # فك ضغط super.img.lz4 (حل مشكلة صورة 15537)
-          SUPER_LZ4=$(find . -name "super.img.lz4" | head -n 1)
-          if [ -n "$SUPER_LZ4" ]; then
-            lz4 -d "$SUPER_LZ4" ../work/super_sparse.img
-            # تحويل لـ Raw عشان lpunpack يشتغل صح
-            simg2img ../work/super_sparse.img ../work/super.img || cp ../work/super_sparse.img ../work/super.img
-          fi
-
-      - name: Unpack Super Image
-        run: |
-          # حفظ حجم السوبر الأصلي لاستخدامه لاحقاً
-          ORIGINAL_SUPER=$(stat -c%s work/super.img)
-          echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER" >> $GITHUB_ENV
+          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -d firmware/
+          find firmware/ -name "*.zip" -exec 7z x -y {} -ofirmware/ \;
+          find firmware/ -name "*.tar*" -exec tar -xf {} -C firmware/ \;
+          # فك ضغط super.img.lz4 وتحويله لـ Raw لضمان فكه (حل مشكلة 15537)
+          SUPER_LZ4=$(find firmware/ -name "super.img.lz4" | head -n 1)
+          lz4 -d "$SUPER_LZ4" work/super_sparse.img
+          simg2img work/super_sparse.img work/super.img || cp work/super_sparse.img work/super.img
+          echo "ORIGINAL_SUPER_SIZE=$(stat -c%s work/super.img)" >> $GITHUB_ENV
           cd partitions && lpunpack ../work/super.img .
 
-      - name: Convert System & Mount
+      - name: Mount & Debloat
         run: |
           mkdir -p mnt extracted_system
           # تحويل البارتيشن لـ Raw قبل التعامل معاه
@@ -67,67 +51,65 @@ jobs:
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
           sudo chown -R runner:runner extracted_system
-
-      - name: Run Your Debloat Script
-        run: |
+          # تشغيل سكربت الديبلوت الخاص بك
           chmod +x debloat.sh
-          # تشغيل السكريبت بتاعك زي ما هو
           sudo ./debloat.sh "$(pwd)/extracted_system"
 
-      - name: Create New System IMG
+      - name: Inject Custom Assets & Features
+        run: |
+          echo "=== Injecting Custom Files from Repo ==="
+          # 1. حقن ملف المميزات (Floating Feature)
+          if [ -f "my_custom_files/etc/floating_feature.xml" ]; then
+            sudo cp -f "my_custom_files/etc/floating_feature.xml" "extracted_system/system/etc/floating_feature.xml"
+            sudo chmod 644 "extracted_system/system/etc/floating_feature.xml"
+          fi
+          # 2. حقن الأصوات (Notifications & UI)
+          if [ -d "my_custom_files/media/audio" ]; then
+            sudo cp -rf my_custom_files/media/audio/* "extracted_system/system/media/audio/"
+          fi
+          # 3. حقن الخلفيات (Wallpaper)
+          if [ -d "my_custom_files/media/wallpaper" ]; then
+            sudo mkdir -p "extracted_system/system/media/wallpaper"
+            sudo cp -rf my_custom_files/media/wallpaper/* "extracted_system/system/media/wallpaper/"
+            # ضمان وجود خلفية افتراضية بنفس اسم ملفك
+            [ -f "extracted_system/system/media/wallpaper/wallpaper.jpg" ] && sudo cp -f "extracted_system/system/media/wallpaper/wallpaper.jpg" "extracted_system/system/media/wallpaper/default_wallpaper.jpg"
+          fi
+          # ضبط الصلاحيات للميديا المضافة
+          sudo find extracted_system/system/media/audio -type f -exec chmod 644 {} +
+          sudo find extracted_system/system/media/audio -type d -exec chmod 755 {} +
+
+      - name: Rebuild System & Super (Fix Exit 73 & No Space)
         run: |
           mkdir -p newimg temp_mount
-          # حل مشكلة No Space (صورة 15542): حساب المساحة بدقة + 250MB احتياطي
+          # حساب المساحة + 400MB Buffer للأصوات والخلفيات الجديدة (حل مشكلة 15542)
           DIR_SIZE=$(sudo du -sb extracted_system | cut -f1)
-          BUFFER=$((250 * 1024 * 1024))
-          RAW_SIZE=$((DIR_SIZE + BUFFER))
-          # التقريب لبلوكات 4096 (مهم جداً للـ lpmake)
-          FINAL_SIZE=$(( (RAW_SIZE + 4095) / 4096 * 4096 ))
-          
+          BUFFER=$((400 * 1024 * 1024))
+          FINAL_SIZE=$(( ((DIR_SIZE + BUFFER) / 4096 + 1) * 4096 ))
           echo "FINAL_SYSTEM_SIZE=$FINAL_SIZE" >> $GITHUB_ENV
-
+          
           truncate -s $FINAL_SIZE newimg/system_mod.img
           mkfs.ext4 -F -b 4096 newimg/system_mod.img
-
           sudo mount -o loop newimg/system_mod.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
-          sync
-          sudo umount temp_mount
-
-      - name: Build New Super (The Fix for Exit 73)
-        run: |
-          # هنا السر: هنستخدم الملف الـ RAW مباشرة وحجمه الـ RAW
-          # ده بيمنع أي لخبطة في الحسابات عند lpmake
+          sync && sudo umount temp_mount
           
-          # حساب حجم الجروب (السوبر - 16MB للهيدر)
+          # بناء السوبر باستخدام ملف RAW وحجم محدد (حل مشكلة 15549 و 15551)
           GROUP_SIZE=$(($ORIGINAL_SUPER_SIZE - 16777216))
+          lpmake --metadata-size 65536 --super-name super --metadata-slots 2 \
+            --device super:${ORIGINAL_SUPER_SIZE} --group main:${GROUP_SIZE} \
+            --partition system:readonly:${FINAL_SIZE}:main \
+            --image system=newimg/system_mod.img --output super_new.img
 
-          lpmake \
-            --metadata-size 65536 \
-            --super-name super \
-            --metadata-slots 2 \
-            --device super:${ORIGINAL_SUPER_SIZE} \
-            --group main:${GROUP_SIZE} \
-            --partition system:readonly:${FINAL_SYSTEM_SIZE}:main \
-            --image system=newimg/system_mod.img \
-            --output super_new.img
-
-      - name: Compress & Final AP
+      - name: Finalize & Upload
         run: |
-          # ضغط السوبر النهائي لتقليل الحجم
           lz4 -B6 --content-size super_new.img super.img.lz4
-          mkdir -p final_ap
-          # نسخ ملفات الفيرموير الأصلية المتبقية
-          cp firmware/*.img final_ap/ 2>/dev/null || true
+          mkdir -p final_ap && cp firmware/*.img final_ap/ 2>/dev/null || true
           mv super.img.lz4 final_ap/
-          cd final_ap
-          tar -cf AP_MODDED.tar *
-          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
+          cd final_ap && tar -cf AP_MODDED.tar * && md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
-
-      - name: Upload Result
-        run: |
-          FILE=$(find final_ap -name "*.tar.md5")
+          # رفع الملف النهائي
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          LINK=$(curl -# -F "file=@$FILE" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "🔗 رابط التحميل الجديد: $LINK"
+          DOWNLOAD_LINK=$(curl -# -F "file=@AP_MODDED.tar.md5" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
+          echo "--------------------------------------------------"
+          echo "✅ Done! Download Link: $DOWNLOAD_LINK"
+          echo "--------------------------------------------------"
