@@ -21,10 +21,8 @@ jobs:
           sudo apt install -y \
             lz4 p7zip-full zip unzip aria2 e2fsprogs android-sdk-libsparse-utils \
             build-essential git zlib1g-dev liblz4-tool jq curl
-          # بناء أدوات تحويل الصور
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
-          # تحميل أدوات البارتيشنز
           mkdir -p bin && cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
@@ -34,53 +32,69 @@ jobs:
       - name: Download & Extract Firmware
         run: |
           mkdir -p firmware && cd firmware
-          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -o firmware.zip
-          if [[ "${{ github.event.inputs.firmware_url }}" == *.zip ]]; then
-            unzip firmware.zip -d .
-          else
-            mv firmware.zip firmware.tar.md5
-          fi
+          aria2c -x16 -s16 --timeout=120 "${{ github.event.inputs.firmware_url }}" -o firmware.zip
+          7z x -y firmware.zip >/dev/null 2>&1
+          # فك ملف AP للوصول لـ super.img.lz4
           AP_FILE=$(ls AP_*)
           tar -xf "$AP_FILE" super.img.lz4 || true
           lz4 -d super.img.lz4 super.img
-          # حفظ حجم السوبر الأصلي لاستخدامه في البناء
           echo "ORIGINAL_SUPER_SIZE=$(stat -c%s super.img)" >> $GITHUB_ENV
-          lpunpack --partition system super.img ../partitions/
           cd ..
 
-      - name: Extract System & Run Debloat
+      - name: Prepare Super Image
         run: |
-          # التأكد من تحويل الصورة لـ Raw قبل الـ Mount
-          simg2img partitions/system.img system_raw.img || mv partitions/system.img system_raw.img
-          mkdir -p extracted_system
-          sudo mount -o loop system_raw.img extracted_system
-          
-          chmod +x debloat.sh
-          sudo ./debloat.sh "$(pwd)/extracted_system"
+          mkdir -p partitions
+          cd partitions
+          lpunpack ../firmware/super.img .
+          ls -lh
 
-      - name: Create New System IMG (QuantumROM Method)
+      - name: Convert System & Mount
+        run: |
+          mkdir -p mnt extracted_system raw
+          simg2img partitions/system.img raw/system_raw.img || cp partitions/system.img raw/system_raw.img
+          sudo mount -o loop raw/system_raw.img mnt
+          sudo cp -a mnt/. extracted_system/
+          sudo umount mnt
+          sudo chown -R runner:runner extracted_system
+
+      - name: Run Debloat + Remove Blur
+        run: |
+          chmod +x debloat.sh
+          echo "APKs before: $(find extracted_system -name "*.apk" | wc -l)"
+          ./debloat.sh extracted_system
+          
+          echo "=== Removing OneUI Blur ==="
+          rm -rf extracted_system/system/system/lib64/*blur* 2>/dev/null || true
+          rm -rf extracted_system/system/system/lib64/*gaussian* 2>/dev/null || true
+          find extracted_system -name "*blur*" | xargs rm -rf 2>/dev/null || true
+
+          echo "APKs after: $(find extracted_system -name "*.apk" | wc -l)"
+
+      - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-          # حساب الحجم الفعلي للملفات + 300MB مساحة عمل (Buffer)
           SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 314572800)) 
+          # إضافة 100 ميجا فقط كـ Buffer لتجنب Error 73
+          SIZE=$((SIZE + 104857600))
           SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
 
+          echo "New System Size = $SIZE"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F -b 4096 newimg/system_new.img
+
           sudo mount -o loop newimg/system_new.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
           sync
           sudo umount temp_mount
-          sudo umount extracted_system
 
       - name: Convert to Sparse & Rebuild Super
         run: |
-          img2simg newimg/system_new.img partitions/system.img
+          img2simg newimg/system_new.img newimg/system.img
+          cp newimg/system.img partitions/system.img
+
           cd partitions
           NEW_SYSTEM_SIZE=$(stat -c%s system.img)
-          
-          # حساب حجم الجروب (السوبر - 16 ميجا للميتا داتا)
+          # حساب مساحة الجروب (مساحة السوبر الأصلية ناقص 16 ميجا للميتا داتا)
           GROUP_SIZE=$(($ORIGINAL_SUPER_SIZE - 16777216))
 
           lpmake \
@@ -103,14 +117,8 @@ jobs:
           md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Modded_AP
-          path: final_ap/AP_MODDED.tar.md5
-
       - name: Upload to GoFile.io
         run: |
-          FILE_PATH="final_ap/AP_MODDED.tar.md5"
+          FILE="final_ap/AP_MODDED.tar.md5"
           SERVER=$(curl -s https://api.gofile.io/getServer | jq -r '.data.server')
-          curl -F "file=@$FILE_PATH" "https://$SERVER.gofile.io/uploadFile"
+          curl -F "file=@$FILE" "https://$SERVER.gofile.io/uploadFile"
