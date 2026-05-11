@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       firmware_url:
-        description: "Direct AP .zip or .tar.md5 link (SamFW)"
+        description: "Direct SamFW AP .zip or .tar.md5 link"
         required: true
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-          # Download lpunpack & lpmake from SReStocker
+          # lpunpack & lpmake من ريبو SReStocker
           mkdir -p bin
           cd bin
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
@@ -42,37 +42,34 @@ jobs:
           echo "Downloading: ${{ github.event.inputs.firmware_url }}"
           aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
 
-      - name: Extract Firmware (ZIP / TAR / LZ4)
+      - name: Extract Firmware (ZIP + tar.md5)
         run: |
           cd firmware
 
-          # Handle ZIP files (most common now)
+          # استخراج الـ ZIP إذا وجد
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
               echo "Extracting ZIP: $zipfile"
-              7z x -y "$zipfile" >/dev/null 2>&1
+              7z x -y "$zipfile" >/dev/null
               rm -f "$zipfile"
             fi
           done
 
-          # Handle .tar.md5 or .tar
+          # البحث عن ملف tar.md5
           APFILE=$(find . -name "*.tar.md5" -o -name "*.tar" | head -n 1)
           if [ -n "$APFILE" ]; then
-            echo "Extracting AP: $APFILE"
-            cp "$APFILE" ap.tar
-            tar -xf ap.tar
-            rm -f ap.tar "$APFILE"
+            echo "Found AP File: $APFILE"
+            cp "$APFILE" ap.tar.md5
+            echo "Extracting AP.tar.md5 ..."
+            tar -xf ap.tar.md5
+            rm -f ap.tar.md5 "$APFILE"
+          else
+            echo "❌ No .tar.md5 file found!"
+            ls -lh
+            exit 1
           fi
 
-          # Handle .lz4 files
-          for lz4file in *.lz4; do
-            if [ -f "$lz4file" ]; then
-              echo "Decompressing: $lz4file"
-              lz4 -d "\( lz4file" " \){lz4file%.lz4}"
-              rm -f "$lz4file"
-            fi
-          done
-
+          echo "Extracted files:"
           ls -lh
 
       - name: Decompress SUPER
@@ -83,7 +80,8 @@ jobs:
           elif [ -f firmware/super.img ]; then
             cp firmware/super.img work/super.img
           else
-            echo "❌ super.img not found!"
+            echo "❌ super.img or super.img.lz4 not found!"
+            ls -lh firmware
             exit 1
           fi
 
@@ -131,7 +129,6 @@ jobs:
       - name: Replace System & Rebuild Super
         run: |
           cp newimg/system.img partitions/system.img
-
           cd partitions
           SYSTEM_SIZE=$(stat -c%s system.img)
 
