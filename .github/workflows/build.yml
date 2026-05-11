@@ -23,7 +23,7 @@ jobs:
             android-sdk-libsparse-utils build-essential git \
             zlib1g-dev liblz4-tool jq curl
 
-          # simg2img & img2simg
+          # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
@@ -81,6 +81,7 @@ jobs:
             echo "❌ super.img not found!" && exit 1
           fi
 
+          echo "Converting super to raw..."
           simg2img work/super_sparse.img work/super.img
           echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
 
@@ -102,7 +103,6 @@ jobs:
           sudo mount -o loop raw/system_raw.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
-          # إصلاح الصلاحيات المهم
           sudo chown -R runner:runner extracted_system
 
       - name: Run Debloat Script
@@ -113,10 +113,12 @@ jobs:
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-          SIZE=$(sudo du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 2147483648))
-          echo "Final System Size = $SIZE bytes"
 
+          # حساب الحجم بشكل أفضل + مساحة إضافية أكبر
+          SIZE=$(sudo du -sb extracted_system | cut -f1)
+          SIZE=$((SIZE + 3221225472))  # +3GB لتجنب مشكلة img2simg
+
+          echo "Final System Size = $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F newimg/system_new.img
 
@@ -129,6 +131,7 @@ jobs:
       - name: Convert to Sparse & Rebuild Super
         run: |
           img2simg newimg/system_new.img newimg/system.img
+
           cp newimg/system.img partitions/system.img
 
           cd partitions
