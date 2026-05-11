@@ -18,7 +18,6 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-
           sudo apt install -y \
             lz4 \
             p7zip-full \
@@ -26,130 +25,109 @@ jobs:
             unzip \
             aria2 \
             e2fsprogs \
-            ext4magic \
-            android-sdk-libsparse-utils
+            android-sdk-libsparse-utils \
+            simg2img \
+            img2simg
 
-          # تنزيل أدوات Android يدوياً
-          mkdir tools
+          # تنزيل Android Platform Tools
+          mkdir -p tools
           cd tools
 
-          wget https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip
           unzip platform-tools-latest-linux.zip
+          sudo cp -r platform-tools/* /usr/local/bin/
+          cd ..
 
-          wget https://dl.google.com/android/repository/otatools.zip
-          unzip otatools.zip || true
+      - name: Download lpunpack & lpmake
+        run: |
+          mkdir -p bin
+          cd bin
 
-          sudo cp -r platform-tools/* /usr/local/bin/ || true
+          # أحدث إصدارات موثوقة
+          wget -q https://github.com/LonelyFool/lpunpack_and_lpmake/releases/latest/download/lpunpack -O lpunpack
+          wget -q https://github.com/LonelyFool/lpunpack_and_lpmake/releases/latest/download/lpmake -O lpmake
+
+          chmod +x lpunpack lpmake
+          sudo mv lpunpack lpmake /usr/local/bin/
 
       - name: Download Firmware
         run: |
-          mkdir firmware
+          mkdir -p firmware
           cd firmware
 
-          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}"
+          echo "Downloading firmware from: ${{ github.event.inputs.firmware_url }}"
+          aria2c -x16 -s16 --timeout=90 --connect-timeout=30 "${{ github.event.inputs.firmware_url }}"
 
       - name: Extract AP
         run: |
-          mkdir extracted
+          mkdir -p extracted
 
           APFILE=$(find firmware -name "*.tar.md5" -o -name "*.tar" | head -n 1)
-
           echo "Using AP File: $APFILE"
 
           cp "$APFILE" ap.tar
-
           tar -xf ap.tar -C extracted
 
       - name: Decompress SUPER
         run: |
-          mkdir work
+          mkdir -p work
 
           if [ -f extracted/super.img.lz4 ]; then
             lz4 -d extracted/super.img.lz4 work/super.img
           elif [ -f extracted/super.img ]; then
-            cp extracted/super.img work/
+            cp extracted/super.img work/super.img
           else
-            echo "super.img not found!"
+            echo "❌ super.img or super.img.lz4 not found!"
             exit 1
           fi
 
-      - name: Download lpunpack Tools
-        run: |
-          mkdir bin
-          cd bin
-
-          wget https://github.com/LineageOS/android_tools_extract-utils/releases/download/latest/lpunpack
-          wget https://github.com/LineageOS/android_tools_extract-utils/releases/download/latest/lpmake
-
-          chmod +x lpunpack
-          chmod +x lpmake
-
-          sudo mv lpunpack /usr/local/bin/
-          sudo mv lpmake /usr/local/bin/
-
       - name: Extract Dynamic Partitions
         run: |
-          mkdir partitions
+          mkdir -p partitions
           cd partitions
-
           lpunpack ../work/super.img .
-
-          ls
+          ls -lh
 
       - name: Convert System IMG
         run: |
-          mkdir raw
-
+          mkdir -p raw
           simg2img partitions/system.img raw/system_raw.img
 
-      - name: Mount System
+      - name: Mount and Copy System
         run: |
-          mkdir mnt
+          mkdir -p mnt extracted_system
+
           sudo mount -o loop raw/system_raw.img mnt
-
-      - name: Copy Mounted System
-        run: |
-          mkdir extracted_system
-
           sudo cp -a mnt/. extracted_system/
-
           sudo umount mnt
 
       - name: Run Debloat Script
         run: |
           chmod +x debloat.sh
-
           ./debloat.sh extracted_system
 
       - name: Create New System IMG
         run: |
-          mkdir newimg
+          mkdir -p newimg temp_mount
 
           SIZE=$(du -sb extracted_system | cut -f1)
+          SIZE=$((SIZE + 2147483648))  # إضافة 2GB مساحة إضافية
 
-          SIZE=$((SIZE + 2147483648))
-
-          echo "Final Size = $SIZE"
+          echo "Final System Size = $SIZE bytes"
 
           truncate -s $SIZE newimg/system_new.img
-
           mkfs.ext4 -F newimg/system_new.img
 
-          mkdir temp_mount
-
           sudo mount -o loop newimg/system_new.img temp_mount
-
           sudo cp -a extracted_system/. temp_mount/
-
           sync
-
           sudo umount temp_mount
 
-      - name: Convert to Sparse
+      - name: Convert to Sparse Image
         run: |
           img2simg newimg/system_new.img newimg/system.img
 
-      - name: Replace Old System
+      - name: Replace System in Partitions
         run: |
           cp newimg/system.img partitions/system.img
 
@@ -175,25 +153,20 @@ jobs:
 
       - name: Build Modified AP
         run: |
-          mkdir final_ap
+          mkdir -p final_ap
 
-          cp extracted/* final_ap/ || true
+          cp extracted/* final_ap/ 2>/dev/null || true
 
-          rm -f final_ap/super.img.lz4
-          rm -f final_ap/super.img
-
+          rm -f final_ap/super.img.lz4 final_ap/super.img
           mv super.img.lz4 final_ap/
 
           cd final_ap
-
           tar -cf AP_MODDED.tar *
 
       - name: Generate MD5
         run: |
           cd final_ap
-
           md5sum -t AP_MODDED.tar >> AP_MODDED.tar
-
           mv AP_MODDED.tar AP_MODDED.tar.md5
 
       - name: Upload Final AP
