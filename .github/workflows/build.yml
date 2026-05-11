@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       firmware_url:
-        description: "Direct AP.tar.md5 link"
+        description: "Direct AP .zip or .tar.md5 link (SamFW)"
         required: true
 
 jobs:
@@ -19,61 +19,69 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
-            lz4 \
-            p7zip-full \
-            zip \
-            unzip \
-            aria2 \
-            e2fsprogs \
-            android-sdk-libsparse-utils \
-            build-essential \
-            git \
-            zlib1g-dev \
-            liblz4-tool
+            lz4 p7zip-full zip unzip aria2 e2fsprogs \
+            android-sdk-libsparse-utils build-essential git \
+            zlib1g-dev liblz4-tool
 
           # Compile simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
-          cd android-simg2img
-          make -j$(nproc)
-          sudo cp simg2img img2simg /usr/local/bin/
-          cd ..
+          cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
-      - name: Download lpunpack & lpmake (من الريبو بتاعك)
-        run: |
+          # Download lpunpack & lpmake from SReStocker
           mkdir -p bin
           cd bin
-
-          # تحميل الأدوات من ريبو SReStocker (أكثر استقراراً)
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
           wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
-
           chmod +x lpunpack lpmake
           sudo mv lpunpack lpmake /usr/local/bin/
-
-          echo "✅ lpunpack & lpmake installed successfully"
 
       - name: Download Firmware
         run: |
           mkdir -p firmware
           cd firmware
-          echo "Downloading firmware: ${{ github.event.inputs.firmware_url }}"
+          echo "Downloading: ${{ github.event.inputs.firmware_url }}"
           aria2c -x16 -s16 --timeout=120 --connect-timeout=60 "${{ github.event.inputs.firmware_url }}"
 
-      - name: Extract AP
+      - name: Extract Firmware (ZIP / TAR / LZ4)
         run: |
-          mkdir -p extracted
-          APFILE=$(find firmware -name "*.tar.md5" -o -name "*.tar" | head -n 1)
-          echo "Using AP File: $APFILE"
-          cp "$APFILE" ap.tar
-          tar -xf ap.tar -C extracted
+          cd firmware
+
+          # Handle ZIP files (most common now)
+          for zipfile in *.zip; do
+            if [ -f "$zipfile" ]; then
+              echo "Extracting ZIP: $zipfile"
+              7z x -y "$zipfile" >/dev/null 2>&1
+              rm -f "$zipfile"
+            fi
+          done
+
+          # Handle .tar.md5 or .tar
+          APFILE=$(find . -name "*.tar.md5" -o -name "*.tar" | head -n 1)
+          if [ -n "$APFILE" ]; then
+            echo "Extracting AP: $APFILE"
+            cp "$APFILE" ap.tar
+            tar -xf ap.tar
+            rm -f ap.tar "$APFILE"
+          fi
+
+          # Handle .lz4 files
+          for lz4file in *.lz4; do
+            if [ -f "$lz4file" ]; then
+              echo "Decompressing: $lz4file"
+              lz4 -d "\( lz4file" " \){lz4file%.lz4}"
+              rm -f "$lz4file"
+            fi
+          done
+
+          ls -lh
 
       - name: Decompress SUPER
         run: |
           mkdir -p work
-          if [ -f extracted/super.img.lz4 ]; then
-            lz4 -d extracted/super.img.lz4 work/super.img
-          elif [ -f extracted/super.img ]; then
-            cp extracted/super.img work/super.img
+          if [ -f firmware/super.img.lz4 ]; then
+            lz4 -d firmware/super.img.lz4 work/super.img
+          elif [ -f firmware/super.img ]; then
+            cp firmware/super.img work/super.img
           else
             echo "❌ super.img not found!"
             exit 1
@@ -107,7 +115,7 @@ jobs:
         run: |
           mkdir -p newimg temp_mount
           SIZE=$(du -sb extracted_system | cut -f1)
-          SIZE=$((SIZE + 2147483648))  # +2GB
+          SIZE=$((SIZE + 2147483648))
           echo "Final System Size = $SIZE bytes"
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F newimg/system_new.img
@@ -120,12 +128,10 @@ jobs:
         run: |
           img2simg newimg/system_new.img newimg/system.img
 
-      - name: Replace System Partition
+      - name: Replace System & Rebuild Super
         run: |
           cp newimg/system.img partitions/system.img
 
-      - name: Rebuild Super IMG
-        run: |
           cd partitions
           SYSTEM_SIZE=$(stat -c%s system.img)
 
@@ -146,7 +152,7 @@ jobs:
       - name: Build Modified AP
         run: |
           mkdir -p final_ap
-          cp extracted/* final_ap/ 2>/dev/null || true
+          cp firmware/* final_ap/ 2>/dev/null || true
           rm -f final_ap/super.img.lz4 final_ap/super.img
           mv super.img.lz4 final_ap/
           cd final_ap
