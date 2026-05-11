@@ -23,7 +23,7 @@ jobs:
             android-sdk-libsparse-utils build-essential git \
             zlib1g-dev liblz4-tool jq curl
 
-          # Compile simg2img & img2simg
+          # simg2img & img2simg
           git clone https://github.com/anestisb/android-simg2img.git
           cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
 
@@ -45,22 +45,17 @@ jobs:
       - name: Full Firmware Extraction
         run: |
           cd firmware
-
           echo "=== Extracting ZIP ==="
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
-              echo "Extracting $zipfile"
-              7z x -y "$zipfile" >/dev/null 2>&1
-              rm -f "$zipfile"
+              7z x -y "$zipfile" >/dev/null 2>&1 && rm -f "$zipfile"
             fi
           done
 
-          echo "=== Extracting tar.md5 files ==="
+          echo "=== Extracting tar.md5 ==="
           for tarfile in *.tar.md5 *.tar; do
             if [ -f "$tarfile" ]; then
-              echo "Extracting $tarfile"
-              tar -xf "$tarfile" >/dev/null 2>&1
-              rm -f "$tarfile"
+              tar -xf "$tarfile" >/dev/null 2>&1 && rm -f "$tarfile"
             fi
           done
 
@@ -68,23 +63,11 @@ jobs:
           find . -name "*.lz4" -print0 | while IFS= read -r -d '' lz4file; do
             if [ -f "$lz4file" ]; then
               outfile="${lz4file%.lz4}"
-              echo "Decompressing: $lz4file"
-              if lz4 -d "$lz4file" "$outfile" 2>/dev/null; then
-                rm -f "$lz4file"
-                echo "✓ $outfile"
-              else
-                echo "⚠️ Failed $lz4file"
-                rm -f "$lz4file"
-              fi
+              lz4 -d "$lz4file" "$outfile" 2>/dev/null && rm -f "$lz4file" || rm -f "$lz4file"
             fi
           done
 
-          echo "=== Extracted Files ==="
-          ls -lh
-          echo "Super files:"
-          find . -name "*super*" -ls || true
-
-      - name: Prepare Super Image (Critical Fix)
+      - name: Prepare Super Image
         run: |
           mkdir -p work
           SUPER_LZ4=$(find firmware -name "super.img.lz4" | head -n 1)
@@ -95,17 +78,10 @@ jobs:
           elif [ -n "$SUPER_SPARSE" ]; then
             cp "$SUPER_SPARSE" work/super_sparse.img
           else
-            echo "❌ super.img not found!"
-            exit 1
+            echo "❌ super.img not found!" && exit 1
           fi
 
-          echo "Converting sparse super.img to raw..."
           simg2img work/super_sparse.img work/super.img
-
-          if [ ! -f work/super.img ]; then
-            echo "❌ Failed to convert super.img"
-            exit 1
-          fi
           echo "✅ super.img ready ($(du -h work/super.img | cut -f1))"
 
       - name: Extract Dynamic Partitions
@@ -126,6 +102,8 @@ jobs:
           sudo mount -o loop raw/system_raw.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
+          # إصلاح الصلاحيات المهم
+          sudo chown -R runner:runner extracted_system
 
       - name: Run Debloat Script
         run: |
@@ -135,15 +113,18 @@ jobs:
       - name: Create New System IMG
         run: |
           mkdir -p newimg temp_mount
-          SIZE=$(du -sb extracted_system | cut -f1)
+          SIZE=$(sudo du -sb extracted_system | cut -f1)
           SIZE=$((SIZE + 2147483648))
           echo "Final System Size = $SIZE bytes"
+
           truncate -s $SIZE newimg/system_new.img
           mkfs.ext4 -F newimg/system_new.img
+
           sudo mount -o loop newimg/system_new.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
           sync
           sudo umount temp_mount
+          sudo chown -R runner:runner newimg
 
       - name: Convert to Sparse & Rebuild Super
         run: |
