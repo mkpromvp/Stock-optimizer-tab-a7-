@@ -15,101 +15,201 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      # ════════════════════════════════════════════════════
+      # FIX: اسم فولدر my_custom_files فيه zero-width space
+      #      ده بيخلي الـ workflow مش يلاقيه — بنعمل rename هنا
+      # ════════════════════════════════════════════════════
+      - name: Fix Custom Files Folder Name
+        run: |
+          # البحث عن أي فولدر اسمه بيخلص بـ my_custom_files بغض النظر عن الأحرف الخفية
+          CUSTOM_DIR=$(find . -maxdepth 1 -type d -name "*my_custom_files*" | head -n 1)
+          if [ -n "$CUSTOM_DIR" ] && [ "$CUSTOM_DIR" != "./my_custom_files" ]; then
+            echo "Found folder with bad name: '$CUSTOM_DIR' — renaming..."
+            mv "$CUSTOM_DIR" my_custom_files
+            echo "Renamed successfully ✅"
+          elif [ -d "my_custom_files" ]; then
+            echo "Folder name is clean ✅"
+          else
+            echo "⚠️  my_custom_files not found — custom injection will be skipped"
+          fi
+
       - name: Install Dependencies
         run: |
-          sudo apt update
-          sudo apt install -y lz4 p7zip-full aria2 e2fsprogs android-sdk-libsparse-utils build-essential git liblz4-tool jq curl
-          # بناء أدوات تحويل الصور
-          git clone https://github.com/anestisb/android-simg2img.git
-          cd android-simg2img && make -j$(nproc) && sudo cp simg2img img2simg /usr/local/bin/ && cd ..
-          # تحميل أدوات السوبر
+          sudo apt-get update -qq
+          sudo apt-get install -y lz4 p7zip-full aria2 e2fsprogs \
+            android-sdk-libsparse-utils build-essential git \
+            liblz4-tool jq curl wget
+
+          # بناء أدوات simg2img / img2simg
+          git clone --depth=1 https://github.com/anestisb/android-simg2img.git
+          cd android-simg2img
+          make -j$(nproc)
+          sudo cp simg2img img2simg /usr/local/bin/
+          cd ..
+
+          # تحميل lpunpack و lpmake
           mkdir -p bin && cd bin
-          wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack -O lpunpack
-          wget -q https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake -O lpmake
+          wget -q "https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpunpack" -O lpunpack
+          wget -q "https://github.com/mkpromvp/SReStocker/raw/master/bin/lp/lpmake"   -O lpmake
           chmod +x lpunpack lpmake
           sudo mv lpunpack lpmake /usr/local/bin/
 
       - name: Download & Prepare Super
         run: |
           mkdir -p firmware work partitions
+
+          # ── تحميل الفيرم ──
           aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -d firmware/
-          find firmware/ -name "*.zip" -exec 7z x -y {} -ofirmware/ \;
-          find firmware/ -name "*.tar*" -exec tar -xf {} -C firmware/ \;
-          # فك ضغط super.img.lz4 وتحويله لـ Raw لضمان فكه (حل مشكلة 15537)
+
+          # ── فك الضغط (zip أو tar) ──
+          find firmware/ -maxdepth 1 -name "*.zip"  -exec 7z x -y {} -ofirmware/ \;
+          find firmware/ -maxdepth 1 -name "*.tar*" -exec tar -xf {} -C firmware/ \;
+
+          # ── فك super.img.lz4 ──
           SUPER_LZ4=$(find firmware/ -name "super.img.lz4" | head -n 1)
+          if [ -z "$SUPER_LZ4" ]; then
+            echo "❌ super.img.lz4 not found!"
+            exit 1
+          fi
+
           lz4 -d "$SUPER_LZ4" work/super_sparse.img
+          # تحويل sparse → raw (لو مش sparse بيكمل عادي)
           simg2img work/super_sparse.img work/super.img || cp work/super_sparse.img work/super.img
-          echo "ORIGINAL_SUPER_SIZE=$(stat -c%s work/super.img)" >> $GITHUB_ENV
+
+          ORIGINAL_SUPER_SIZE=$(stat -c%s work/super.img)
+          echo "ORIGINAL_SUPER_SIZE=$ORIGINAL_SUPER_SIZE" >> $GITHUB_ENV
+          echo "Super size: $ORIGINAL_SUPER_SIZE bytes"
+
+          # ── فك محتويات super ──
           cd partitions && lpunpack ../work/super.img .
 
       - name: Mount & Debloat
         run: |
           mkdir -p mnt extracted_system
-          # تحويل البارتيشن لـ Raw قبل التعامل معاه
-          simg2img partitions/system.img partitions/system_raw.img || cp partitions/system.img partitions/system_raw.img
+
+          # تحويل system.img لـ raw لو كان sparse
+          simg2img partitions/system.img partitions/system_raw.img \
+            || cp partitions/system.img partitions/system_raw.img
+
           sudo mount -o loop partitions/system_raw.img mnt
           sudo cp -a mnt/. extracted_system/
           sudo umount mnt
           sudo chown -R runner:runner extracted_system
-          # تشغيل سكربت الديبلوت الخاص بك
+
+          # تشغيل سكربت الديبلوت
           chmod +x debloat.sh
-          sudo ./debloat.sh "$(pwd)/extracted_system"
+          bash debloat.sh "$(pwd)/extracted_system"
 
       - name: Inject Custom Assets & Features
         run: |
           echo "=== Injecting Custom Files from Repo ==="
+
           # 1. حقن ملف المميزات (Floating Feature)
           if [ -f "my_custom_files/etc/floating_feature.xml" ]; then
-            sudo cp -f "my_custom_files/etc/floating_feature.xml" "extracted_system/system/etc/floating_feature.xml"
+            sudo cp -f "my_custom_files/etc/floating_feature.xml" \
+              "extracted_system/system/etc/floating_feature.xml"
             sudo chmod 644 "extracted_system/system/etc/floating_feature.xml"
+            echo "✅ floating_feature.xml injected"
+          else
+            echo "⚠️  floating_feature.xml not found — skipping"
           fi
+
           # 2. حقن الأصوات (Notifications & UI)
           if [ -d "my_custom_files/media/audio" ]; then
-            sudo cp -rf my_custom_files/media/audio/* "extracted_system/system/media/audio/"
+            sudo cp -rf my_custom_files/media/audio/* \
+              "extracted_system/system/media/audio/"
+            echo "✅ Audio files injected"
           fi
-          # 3. حقن الخلفيات (Wallpaper)
+
+          # 3. حقن الخلفيات
           if [ -d "my_custom_files/media/wallpaper" ]; then
             sudo mkdir -p "extracted_system/system/media/wallpaper"
-            sudo cp -rf my_custom_files/media/wallpaper/* "extracted_system/system/media/wallpaper/"
-            # ضمان وجود خلفية افتراضية بنفس اسم ملفك
-            [ -f "extracted_system/system/media/wallpaper/wallpaper.jpg" ] && sudo cp -f "extracted_system/system/media/wallpaper/wallpaper.jpg" "extracted_system/system/media/wallpaper/default_wallpaper.jpg"
+            sudo cp -rf my_custom_files/media/wallpaper/* \
+              "extracted_system/system/media/wallpaper/"
+            # نسخ الخلفية كـ default_wallpaper أيضاً
+            if [ -f "extracted_system/system/media/wallpaper/wallpaper.jpg" ]; then
+              sudo cp -f "extracted_system/system/media/wallpaper/wallpaper.jpg" \
+                "extracted_system/system/media/wallpaper/default_wallpaper.jpg"
+            fi
+            echo "✅ Wallpapers injected"
           fi
-          # ضبط الصلاحيات للميديا المضافة
-          sudo find extracted_system/system/media/audio -type f -exec chmod 644 {} +
-          sudo find extracted_system/system/media/audio -type d -exec chmod 755 {} +
 
-      - name: Rebuild System & Super (Fix Exit 73 & No Space)
+          # ضبط صلاحيات الميديا
+          sudo find extracted_system/system/media/audio -type f -exec chmod 644 {} + 2>/dev/null || true
+          sudo find extracted_system/system/media/audio -type d -exec chmod 755 {} + 2>/dev/null || true
+
+      - name: Rebuild System & Super
         run: |
           mkdir -p newimg temp_mount
-          # حساب المساحة + 400MB Buffer للأصوات والخلفيات الجديدة (حل مشكلة 15542)
+
+          # حساب الحجم + 400MB buffer للملفات المضافة
           DIR_SIZE=$(sudo du -sb extracted_system | cut -f1)
           BUFFER=$((400 * 1024 * 1024))
           FINAL_SIZE=$(( ((DIR_SIZE + BUFFER) / 4096 + 1) * 4096 ))
           echo "FINAL_SYSTEM_SIZE=$FINAL_SIZE" >> $GITHUB_ENV
-          
+          echo "System image size: $FINAL_SIZE bytes (dir=$DIR_SIZE + buffer=$BUFFER)"
+
           truncate -s $FINAL_SIZE newimg/system_mod.img
           mkfs.ext4 -F -b 4096 newimg/system_mod.img
           sudo mount -o loop newimg/system_mod.img temp_mount
           sudo cp -a extracted_system/. temp_mount/
           sync && sudo umount temp_mount
-          
-          # بناء السوبر باستخدام ملف RAW وحجم محدد (حل مشكلة 15549 و 15551)
-          GROUP_SIZE=$(($ORIGINAL_SUPER_SIZE - 16777216))
-          lpmake --metadata-size 65536 --super-name super --metadata-slots 2 \
-            --device super:${ORIGINAL_SUPER_SIZE} --group main:${GROUP_SIZE} \
+
+          # حساب group size — يضمن إنه مش يطلع سالب
+          MIN_GROUP=$(($FINAL_SIZE + 4096))
+          CALC_GROUP=$(($ORIGINAL_SUPER_SIZE - 16777216))
+          if [ $CALC_GROUP -lt $MIN_GROUP ]; then
+            GROUP_SIZE=$MIN_GROUP
+            echo "⚠️  Group size adjusted to fit system: $GROUP_SIZE"
+          else
+            GROUP_SIZE=$CALC_GROUP
+          fi
+
+          # بناء super.img جديد
+          lpmake \
+            --metadata-size 65536 \
+            --super-name super \
+            --metadata-slots 2 \
+            --device super:${ORIGINAL_SUPER_SIZE} \
+            --group main:${GROUP_SIZE} \
             --partition system:readonly:${FINAL_SIZE}:main \
-            --image system=newimg/system_mod.img --output super_new.img
+            --image system=newimg/system_mod.img \
+            --output super_new.img
 
       - name: Finalize & Upload
         run: |
+          # ضغط super.img الجديد
           lz4 -B6 --content-size super_new.img super.img.lz4
-          mkdir -p final_ap && cp firmware/*.img final_ap/ 2>/dev/null || true
+
+          # تجميع AP
+          mkdir -p final_ap
+
+          # نسخ الـ imgs الأصلية (بوت + vbmeta إلخ) — مع تجاهل لو مفيش
+          find firmware/ -maxdepth 1 -name "*.img" \
+            ! -name "super*" \
+            -exec cp {} final_ap/ \; 2>/dev/null || true
+
           mv super.img.lz4 final_ap/
-          cd final_ap && tar -cf AP_MODDED.tar * && md5sum -t AP_MODDED.tar >> AP_MODDED.tar
+
+          # إنشاء AP_MODDED.tar.md5
+          cd final_ap
+          tar -cf AP_MODDED.tar *
+          md5sum -t AP_MODDED.tar >> AP_MODDED.tar
           mv AP_MODDED.tar AP_MODDED.tar.md5
-          # رفع الملف النهائي
-          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          DOWNLOAD_LINK=$(curl -# -F "file=@AP_MODDED.tar.md5" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-          echo "--------------------------------------------------"
-          echo "✅ Done! Download Link: $DOWNLOAD_LINK"
-          echo "--------------------------------------------------"
+
+          # رفع على GoFile
+          SERVER=$(curl -sf https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          if [ -z "$SERVER" ]; then
+            echo "❌ Could not get GoFile server"
+            exit 1
+          fi
+
+          DOWNLOAD_LINK=$(curl -# \
+            -F "file=@AP_MODDED.tar.md5" \
+            "https://${SERVER}.gofile.io/uploadFile" \
+            | jq -r '.data.downloadPage')
+
+          echo "────────────────────────────────────────────"
+          echo "✅  Done!"
+          echo "📥  Download: $DOWNLOAD_LINK"
+          echo "────────────────────────────────────────────"
